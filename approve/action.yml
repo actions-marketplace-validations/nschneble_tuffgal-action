@@ -111,6 +111,9 @@ runs:
             return;
           }
 
+          // provides an immediate acknowledgement
+          await react('eyes');
+
           core.setOutput('proceed', 'true');
           core.setOutput('pr_number', String(issue.number));
           core.setOutput('comment_id', String(comment.id));
