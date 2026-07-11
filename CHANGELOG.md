@@ -6,6 +6,12 @@ this project uses [Pride Versioning](https://pridever.org) → `PROUD.DEFAULT.SH
 
 ## [Unreleased]
 
+### Added
+
+- `approve` sub-action: opt-in `token` input for the baseline commit
+  - Defaults to `GITHUB_TOKEN`, which GitHub will not use to re-trigger the consumer's visual workflow
+  - Supply a PAT or GitHub App installation token to have the visual check re-run automatically against the new baselines
+
 ### Fixed
 
 - `approve` now reacts "👀" the moment the permission gate accepts, before
@@ -13,6 +19,9 @@ this project uses [Pride Versioning](https://pridever.org) → `PROUD.DEFAULT.SH
   unresponsive trigger
 - `approve` no longer coin-flips when a run carries multiple candidates
   artifacts
+- `approve` success comment no longer claims the next visual run "should pass"
+  - With the default `GITHUB_TOKEN` it now explains the check will not re-run on its own and lists how to kick it
+  - With a custom `token` it states the check re-runs automatically
 
 ## [v1.0.0] - 2026-07-10
 
