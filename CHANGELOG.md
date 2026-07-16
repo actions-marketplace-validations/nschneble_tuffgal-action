@@ -6,7 +6,17 @@ this project uses [Pride Versioning](https://pridever.org) → `PROUD.DEFAULT.SH
 
 ## [Unreleased]
 
-_Nothing just yet_
+## [v1.2.1] - 2026-07-16
+
+### Added
+
+- `pages-token` input to auto-enable the per-PR Pages preview
+  - Pass an admin PAT / GitHub App token to have the first run create the Pages site; defaults to `GITHUB_TOKEN`
+
+### Fixed
+
+- Docs no longer claim `GITHUB_TOKEN` + `pages: write` auto-enables Pages — GitHub reserves site creation for a repo-admin credential, so enable Pages once by hand or supply `pages-token`
+- The auto-enable warning now names the concrete fix (enable by hand, or set `pages-token`)
 
 ## [v1.2.0] - 2026-07-16
 
@@ -141,7 +151,8 @@ Outputs:
 Targets Node 22+
 Compatible with `tuffgal@^0.1.0-alpha.2`
 
-[Unreleased]: https://github.com/nschneble/tuffgal-action/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/nschneble/tuffgal-action/compare/v1.2.1...HEAD
+[v1.2.1]: https://github.com/nschneble/tuffgal-action/releases/tag/v1.2.1
 [v1.2.0]: https://github.com/nschneble/tuffgal-action/releases/tag/v1.2.0
 [v1.1.0]: https://github.com/nschneble/tuffgal-action/releases/tag/v1.1.0
 [v1.0.1]: https://github.com/nschneble/tuffgal-action/releases/tag/v1.0.1
