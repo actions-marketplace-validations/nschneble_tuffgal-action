@@ -6,7 +6,16 @@ this project uses [Pride Versioning](https://pridever.org) → `PROUD.DEFAULT.SH
 
 ## [Unreleased]
 
-_Nothing right now_
+_Nothing just yet_
+
+## [v1.2.0] - 2026-07-16
+
+### Added
+
+- Dynamic per-PR previews
+- PRs with pending story changes get a published report
+- Stories can be deep-linked (courtesy Tuffgal 0.2.0-alpha.3)
+- Checkbox approval to compliment the @tuffgal approve comment
 
 ## [v1.1.0] - 2026-07-11
 
@@ -132,7 +141,8 @@ Outputs:
 Targets Node 22+
 Compatible with `tuffgal@^0.1.0-alpha.2`
 
-[Unreleased]: https://github.com/nschneble/tuffgal-action/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/nschneble/tuffgal-action/compare/v1.2.0...HEAD
+[v1.2.0]: https://github.com/nschneble/tuffgal-action/releases/tag/v1.2.0
 [v1.1.0]: https://github.com/nschneble/tuffgal-action/releases/tag/v1.1.0
 [v1.0.1]: https://github.com/nschneble/tuffgal-action/releases/tag/v1.0.1
 [v1.0.0]: https://github.com/nschneble/tuffgal-action/releases/tag/v1.0.0
