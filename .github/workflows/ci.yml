@@ -69,6 +69,10 @@ jobs:
           craft "$work/evil-type.zip"     'visit-home/payload.sh'
           craft "$work/evil-traversal.zip" '../escape.png'
           craft "$work/evil-absolute.zip" '/etc/passwd.png'
+          # A Windows-separator name carries an allowed extension, so only the
+          # backslash arm catches it. writestr keeps the literal `\`; the zip CLI
+          # would normalize it away.
+          craft "$work/evil-backslash.zip" 'visit-home\payload.png'
 
           # A symlink entry carries an allowed extension but is not a regular
           # file. The mode is stamped into the entry's external_attr high bits
@@ -87,7 +91,7 @@ jobs:
 
           craft_symlink "$work/evil-symlink.zip" 'visit-home/0.png' '/etc/passwd'
 
-          for bad in evil-type evil-traversal evil-absolute evil-symlink; do
+          for bad in evil-type evil-traversal evil-absolute evil-backslash evil-symlink; do
             if bash "$validator" "$work/$bad.zip"; then
               echo "FAIL: $bad.zip was accepted but should be rejected" >&2; exit 1
             fi
@@ -160,13 +164,13 @@ jobs:
             fi
           done
 
-  # Unit test for the Pages-preview push-retry decision — the pure
-  # retryable-vs-terminal classification extracted into scripts/pages-push.js.
-  # The concurrent-PR push race can't be exercised in CI (it needs two
-  # overlapping live PRs), so the git side effects are proven only by review;
-  # this locks the one part with a right answer — that a non-fast-forward
-  # rejection retries while a permission failure falls straight to fallback.
-  pages-push-retry-unit:
+  # Unit tests for the root scripts/ modules' PURE logic — the Pages-preview
+  # push-retry decision (pages-push.js), whose concurrent-PR race can't be
+  # exercised in CI, and the sticky-comment body builder (build-comment.js),
+  # whose github-script step can't run without a live PR. The scripts/*.test.js
+  # glob runs both; the git and GitHub-API side effects stay proven by review
+  # while the parts with a right answer are locked here.
+  scripts-unit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -175,7 +179,7 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
-      - name: Run pages-push retry-decision unit tests
+      - name: Run scripts unit tests
         shell: bash
         run: node --test scripts/*.test.js
 
@@ -213,6 +217,71 @@ jobs:
           # shellcheck disable=SC2016
           if grep -Fq 'process.env.GITHUB_ACTION_PATH}/scripts/pages-push.js' action.yml; then
             echo "action.yml reintroduced the GITHUB_ACTION_PATH require, which resolves to github-script's own dir inside the nested step." >&2
+            exit 1
+          fi
+
+  # Source lock for the module require inside the nested github-script sticky
+  # PR-comment step. `github.action_path` is only supported in composite actions;
+  # inside a nested github-script step `GITHUB_ACTION_PATH` points at
+  # github-script's OWN action dir, not this composite's — so requiring the
+  # module via `GITHUB_ACTION_PATH` resolves to a nonexistent path and crashes
+  # the step at runtime. The comment step can't run in CI (needs a live PR), so
+  # this job locks the documented-correct idiom in source: the composite passes
+  # its `github.action_path` through the step env as ACTION_PATH and the script
+  # requires from that.
+  build-comment-require-source-lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Comment step require resolves via the composite action path (source lock)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The composite must expose its own dir as ACTION_PATH...
+          # shellcheck disable=SC2016
+          if ! grep -Fq 'ACTION_PATH: ${{ github.action_path }}' action.yml; then
+            echo "action.yml comment step must pass github.action_path through the ACTION_PATH step env." >&2
+            exit 1
+          fi
+          # ...and the script must require the module from ACTION_PATH.
+          # shellcheck disable=SC2016
+          if ! grep -Fq 'require(`${process.env.ACTION_PATH}/scripts/build-comment.js`)' action.yml; then
+            echo "action.yml comment step must require build-comment.js via process.env.ACTION_PATH." >&2
+            exit 1
+          fi
+          # The broken bare-GITHUB_ACTION_PATH require (wrong dir inside a nested
+          # github-script step) must NOT reappear.
+          # shellcheck disable=SC2016
+          if grep -Fq 'process.env.GITHUB_ACTION_PATH}/scripts/build-comment.js' action.yml; then
+            echo "action.yml reintroduced the GITHUB_ACTION_PATH require, which resolves to github-script's own dir inside the nested step." >&2
+            exit 1
+          fi
+
+  # Source lock for the Pages-step token-leak fix. That step embeds the push
+  # token in a credentialed remote URL, and an execFileSync error message
+  # carries the full argv — so without masking, a custom pages-token (only
+  # auto-masked when it comes from a secret) would print in cleartext on any git
+  # failure. The step can't run in CI (needs a live PR), so this job locks the
+  # two guards in source: the token is registered with the runner's log masking
+  # (core.setSecret) and the push-error surface is redacted before logging.
+  pages-token-mask-require-source-lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Pages step masks + redacts the push token (source lock)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The token must be registered with the runner's secret masking so it
+          # is redacted everywhere in the log stream.
+          if ! grep -Fq 'core.setSecret(token)' action.yml; then
+            echo "action.yml Pages step must call core.setSecret(token) so a custom pages-token is masked in the logs." >&2
+            exit 1
+          fi
+          # The push-failure log must go through the redactor, never emit the raw
+          # error message (which carries the credentialed remote URL).
+          if ! grep -Fq 'redact(e.message)' action.yml; then
+            echo "action.yml Pages step must redact the push error before logging it (redact(e.message))." >&2
             exit 1
           fi
 
@@ -770,3 +839,34 @@ jobs:
           echo "regression-proof: the unguarded first jq exits $rc on garbage (the guard is load-bearing)."
 
           echo "parse-malformed-results: all cases passed"
+
+  # The harness outcome drives the job's exit code: action.yml's "Surface
+  # harness exit code" step exits non-zero when the parse step reports `failed`
+  # or `no-results` (among others). The smoke jobs exercise pass/changed/
+  # env-mismatch, but not the `failed` and `no-results` legs. This job locks
+  # both — the parse step still maps a non-zero failed count to `failed` and a
+  # missing results.json to `no-results`, and the surface step still turns each
+  # into a non-zero exit. The parse logic is pure jq-over-JSON bash (no browser),
+  # so it replays here directly.
+  outcome-exit-code-mapping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Surface step exit condition pins every fail-mapped outcome (source lock)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The "Surface harness exit code" step is what turns a parsed outcome
+          # into the job's exit code. Pin its FULL if: condition as one literal so
+          # dropping or reordering any arm — failed / no-results / env-mismatch /
+          # (fail-on-changed && changed) — trips this job. The parse precedence
+          # that PRODUCES those outcomes is exercised behaviorally by
+          # parse-malformed-results + the smoke-* jobs; this lock only asserts the
+          # outcome→non-zero-exit mapping stays intact.
+          expected="steps.outcome.outputs.outcome == 'failed' || steps.outcome.outputs.outcome == 'no-results' || steps.outcome.outputs.outcome == 'env-mismatch' || (inputs.fail-on-changed == 'true' && steps.outcome.outputs.outcome == 'changed')"
+          if ! grep -Fq "$expected" action.yml; then
+            echo "action.yml 'Surface harness exit code' if: condition changed — update this lock and confirm every fail-mapped outcome still exits non-zero." >&2
+            exit 1
+          fi
+          echo "outcome-exit-code-mapping: surface-step exit condition locked"

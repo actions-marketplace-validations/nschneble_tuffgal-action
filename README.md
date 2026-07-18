@@ -61,6 +61,8 @@ jobs:
           setup-script: test:ui:setup
 ```
 
+(Also available at [`examples/tuffgal.yml`](examples/tuffgal.yml).)
+
 For a static-site project that doesn't need a database, you can drop the
 `services:` block and the `setup-script` input.
 
@@ -93,8 +95,9 @@ It needs two things on the consumer repo:
 > token via the **`pages-token`** input — then the first run enables Pages
 > itself. (`pages: write` alone does **not** grant site creation.)
 
-The preview is best-effort. If Pages is off, the repo is private, or the
-push is blocked, the step logs a warning and the comment falls back to the
+The preview is best-effort. Expected not-configured states — Pages off, the
+repo is private, or the push is blocked — log a notice; only unexpected git/API
+failures log a warning. Either way the comment falls back to the
 artifact-download links. Set `pages-preview: false` to skip it entirely.
 
 Your app must boot and seed deterministically in CI. That's the one
@@ -110,11 +113,11 @@ contract the CI-owned-baselines model asks of a consumer.
 | `headed`            | `false`               | Run with `--headed` (rarely useful in CI)                                                                                                                                                                         |
 | `install-browsers`  | `true`                | Run `npx playwright install --with-deps chromium` before the harness                                                                                                                                              |
 | `node-version`      | `22`                  | Node.js version (Tuffgal requires Node 22+)                                                                                                                                                                       |
-| `pages-preview`     | `true`                | Publish the report + baselines to a per-PR GitHub Pages preview so the comment can deep-link to changed stories. Needs `contents: write` + Pages enabled; PUBLIC repos only; degrades to artifact links otherwise |
 | `pages-branch`      | `gh-pages`            | Branch the per-PR preview is published to (only used when `pages-preview` is on)                                                                                                                                  |
+| `pages-preview`     | `true`                | Publish the report + baselines to a per-PR GitHub Pages preview so the comment can deep-link to changed stories. Needs `contents: write` + Pages enabled; PUBLIC repos only; degrades to artifact links otherwise |
 | `pages-token`       | `${{ github.token }}` | Token to push the preview branch and auto-enable Pages. The default `GITHUB_TOKEN` pushes but can't create the Pages site (enable Pages once by hand); pass an admin PAT / App token to auto-enable it            |
 | `report-path`       | `tuffgal/report`      | Path to the report directory, relative to `working-directory` (must match `paths.report` in `tuffgal.config.ts`)                                                                                                  |
-| `retention-days`    | `14`                  | Artifact retention                                                                                                                                                                                                |
+| `retention-days`    | `14`                  | Artifact retention (days)                                                                                                                                                                                         |
 | `setup-script`      | `''`                  | Optional npm script to run before the harness (e.g. DB bootstrap)                                                                                                                                                 |
 | `story`             | `''`                  | Filter to a single story (`--story <name>`)                                                                                                                                                                       |
 | `upload-artifacts`  | `true`                | Upload the report + candidate baselines as workflow artifacts when visual changes await review                                                                                                                    |
@@ -125,7 +128,7 @@ contract the CI-owned-baselines model asks of a consumer.
 | Name           | Description                                                                                                                                                                    |
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `changed`      | Number of stories whose committed baseline changed (pixels or a11y snapshot)                                                                                                   |
-| `deleted`      | Number of orphaned baseline entries with no matching story (pruned on approve)                                                                                                 |
+| `deleted`      | Number of orphaned baseline entries with no matching story/action (pruned on approve)                                                                                          |
 | `env-mismatch` | `'true'` when the capture environment in `baselines/manifest.json` no longer matches this CI run (expect a full re-approve)                                                    |
 | `failed`       | Number of stories that failed                                                                                                                                                  |
 | `new`          | Number of stories with no committed baseline yet (candidate written)                                                                                                           |
@@ -195,7 +198,8 @@ jobs:
         contains(github.event.comment.body, '@tuffgal approve') ||
         (github.event.action == 'edited' &&
          contains(github.event.comment.body, 'tuffgal-approve-box') &&
-         contains(github.event.comment.body, '[x] <!-- tuffgal-approve-box'))
+         (contains(github.event.comment.body, '[x] <!-- tuffgal-approve-box') ||
+          contains(github.event.comment.body, '[X] <!-- tuffgal-approve-box')))
       )
     runs-on: ubuntu-latest
     permissions:
@@ -206,8 +210,10 @@ jobs:
       - uses: nschneble/tuffgal-action/approve@v1
         with:
           working-directory: .
+          # artifact-name: tuffgal-candidates # set a unique name per visual job for matrix / smoke suites
           # baselines-path: tuffgal/baselines
-          # artifact-name: tuffgal-candidates
+          # git-user-email: tuffgal-bot@users.noreply.github.com
+          # git-user-name: tuffgal[bot]
           # node-version: "22"
           # token: ${{ secrets.TUFFGAL_APPROVE_TOKEN }}
 ```
@@ -255,14 +261,17 @@ by hand.
   gets an immediate acknowledgement so a mid-run failure is distinguishable
   from an unresponsive trigger, then "🚀" once the baselines land.
 - It writes **only** files from the candidates artifact, path-scoped to the
-  baselines directory. Absolute paths, path traversal, or unexpected file
-  types in the artifact fail the job closed.
+  baselines directory. Absolute paths, path traversal, backslash paths,
+  symlink entries, or unexpected file types in the artifact fail the job
+  closed.
 - It reads the PR head's existing baselines as data, but **refuses any symlink
   among them fail-closed** — a write collaborator could otherwise commit
   `baselines/x.png -> ../../.npmrc` (or `/proc/self/environ`), and following it
   would blob the secret target's bytes back onto the branch. A symlink there
   fails the job closed.
 - The comment body is never interpolated into a shell command.
+
+To report a vulnerability, see [SECURITY.md](.github/SECURITY.md).
 
 ### Implicit: download and approve locally
 
