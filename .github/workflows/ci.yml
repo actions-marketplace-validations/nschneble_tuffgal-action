@@ -10,9 +10,9 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Lint workflows
-        uses: reviewdog/action-actionlint@v1
+        uses: reviewdog/action-actionlint@6fb7acc99f4a1008869fa8a0f09cfca740837d9d # v1.72.0
         with:
           fail_level: error
           reporter: github-check
@@ -20,7 +20,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          # Pin the actionlint installer to a tagged release and verify its
+          # SHA256 before executing. On push to main this job carries a
+          # write-capable token, so fetch-and-run from the moving `main` ref of
+          # a third-party repo is a live remote-code-execution vector — the tag
+          # + checksum close it.
+          installer="$(mktemp)"
+          curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash -o "$installer"
+          echo "72fa3e45ac20f3c3a512d6747b4fcf719e21f890e8c43e78d48a41fdfb900c4e  $installer" | sha256sum -c -
+          # Pin the actionlint binary version too — the installer's built-in
+          # default lags its own release tag.
+          bash "$installer" 1.7.12
           ./actionlint examples/*.yml
 
   # Security unit test for the approve artifact validator — no live GitHub run
@@ -28,7 +38,7 @@ jobs:
   validate-artifact:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Reject malicious + accept clean artifacts
         shell: bash
         run: |
@@ -85,10 +95,131 @@ jobs:
 
           echo "validator: all cases passed"
 
+  # Unit tests for the approve flow's PURE logic — the commit step's path guard,
+  # file walk, frame derivation, and deletions set-difference (baseline-tree.js),
+  # the permission-gate trigger/actor resolution (resolve-approver.js), and the
+  # fail-closed candidate-artifact selection (select-candidate.js). The
+  # approve/scripts/*.test.js glob runs all three. No live GitHub run needed; no
+  # deps beyond Node's built-in node:test + node:assert. Also unit-locks the
+  # subdir-frame correctness alongside the approve-subdir-frame smoke job below.
+  approve-scripts-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # Pin an explicit Node so the node:test stable-API floor is guaranteed
+      # rather than inherited from the runner's default (which can lag).
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+      - name: Run approve/scripts unit tests
+        shell: bash
+        run: node --test approve/scripts/*.test.js
+
+  # Source lock for the module requires inside the nested github-script approve
+  # steps. `github.action_path` is only supported in composite actions; inside a
+  # nested github-script step `GITHUB_ACTION_PATH` points at github-script's OWN
+  # action dir, not this composite's — so requiring a module via
+  # `GITHUB_ACTION_PATH` resolves to a nonexistent path and crashes the step at
+  # runtime. The comment-gated approve flow can't run in CI, so this job is the
+  # only tripwire against the require-blocker regression: it locks the
+  # documented-correct idiom in source for all three approve modules —
+  # baseline-tree.js (commit step), resolve-approver.js (permission gate), and
+  # select-candidate.js (download step) — asserting the composite passes its
+  # `github.action_path` through the step env as ACTION_PATH and each script
+  # requires from that.
+  approve-require-source-lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Approve-step requires resolve via the composite action path (source lock)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The composite must expose its own dir as ACTION_PATH...
+          # shellcheck disable=SC2016
+          if ! grep -Fq 'ACTION_PATH: ${{ github.action_path }}' approve/action.yml; then
+            echo "approve/action.yml must pass github.action_path through the ACTION_PATH step env." >&2
+            exit 1
+          fi
+          # ...and each approve module must be required from ACTION_PATH, never via
+          # the bare GITHUB_ACTION_PATH form (which resolves to github-script's own
+          # dir inside the nested step).
+          # shellcheck disable=SC2016
+          good_prefix='require(`${process.env.ACTION_PATH}/scripts/'
+          # shellcheck disable=SC2016
+          good_suffix='.js`)'
+          bad_prefix='process.env.GITHUB_ACTION_PATH}/scripts/'
+          for mod in baseline-tree resolve-approver select-candidate; do
+            if ! grep -Fq "${good_prefix}${mod}${good_suffix}" approve/action.yml; then
+              echo "approve/action.yml must require $mod.js via process.env.ACTION_PATH." >&2
+              exit 1
+            fi
+            if grep -Fq "${bad_prefix}${mod}.js" approve/action.yml; then
+              echo "approve/action.yml reintroduced the GITHUB_ACTION_PATH require for $mod.js, which resolves to github-script's own dir inside the nested step." >&2
+              exit 1
+            fi
+          done
+
+  # Unit test for the Pages-preview push-retry decision — the pure
+  # retryable-vs-terminal classification extracted into scripts/pages-push.js.
+  # The concurrent-PR push race can't be exercised in CI (it needs two
+  # overlapping live PRs), so the git side effects are proven only by review;
+  # this locks the one part with a right answer — that a non-fast-forward
+  # rejection retries while a permission failure falls straight to fallback.
+  pages-push-retry-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # Pin an explicit Node so the node:test stable-API floor is guaranteed
+      # rather than inherited from the runner's default (which can lag).
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+      - name: Run pages-push retry-decision unit tests
+        shell: bash
+        run: node --test scripts/*.test.js
+
+  # Source lock for the module require inside the nested github-script Pages
+  # step. `github.action_path` is only supported in composite actions; inside a
+  # nested github-script step `GITHUB_ACTION_PATH` points at github-script's OWN
+  # action dir, not this composite's — so requiring the module via
+  # `GITHUB_ACTION_PATH` resolves to a nonexistent path and crashes the step at
+  # runtime. The Pages preview can't run in CI (needs a live PR), so this job
+  # locks the documented-correct idiom in source: the composite passes its
+  # `github.action_path` through the step env as ACTION_PATH and the script
+  # requires from that.
+  pages-push-require-source-lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Pages step require resolves via the composite action path (source lock)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The composite must expose its own dir as ACTION_PATH...
+          # shellcheck disable=SC2016
+          if ! grep -Fq 'ACTION_PATH: ${{ github.action_path }}' action.yml; then
+            echo "action.yml Pages step must pass github.action_path through the ACTION_PATH step env." >&2
+            exit 1
+          fi
+          # ...and the script must require the module from ACTION_PATH.
+          # shellcheck disable=SC2016
+          if ! grep -Fq 'require(`${process.env.ACTION_PATH}/scripts/pages-push.js`)' action.yml; then
+            echo "action.yml Pages step must require pages-push.js via process.env.ACTION_PATH." >&2
+            exit 1
+          fi
+          # The broken bare-GITHUB_ACTION_PATH require (wrong dir inside a nested
+          # github-script step) must NOT reappear.
+          # shellcheck disable=SC2016
+          if grep -Fq 'process.env.GITHUB_ACTION_PATH}/scripts/pages-push.js' action.yml; then
+            echo "action.yml reintroduced the GITHUB_ACTION_PATH require, which resolves to github-script's own dir inside the nested step." >&2
+            exit 1
+          fi
+
   smoke-pass:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - uses: ./
         id: tuffgal
@@ -118,7 +249,7 @@ jobs:
   smoke-changed-new:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       # Remove the committed baseline so the story has no baseline to compare
       # against — CI mode reports it as `new` and writes a candidate.
@@ -164,7 +295,7 @@ jobs:
   smoke-changed-drift:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       # Keep the committed baseline but change the rendered page so the compare
       # drifts — exercises the genuine `changed` path, not just missing-baseline.
@@ -204,7 +335,7 @@ jobs:
   smoke-deleted:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       # Add an orphan baseline with no matching story/action so CI mode reports
       # it as `deleted`. The committed visit-home baseline still passes.
@@ -251,7 +382,7 @@ jobs:
   smoke-env-mismatch:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       # Doctor the committed manifest so its recorded platform (darwin) no
       # longer matches this Linux runner. Only `platform` is rewritten — the
@@ -304,7 +435,7 @@ jobs:
   smoke-fail-on-changed-default:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       # A pending change must FAIL the job under the new default (fail-on-changed
       # defaults to true) — the headline breaking change of v1.
@@ -333,3 +464,309 @@ jobs:
             echo "Expected the action step to FAIL under default fail-on-changed=true, got '$STEP_OUTCOME'." >&2
             exit 1
           fi
+
+  # Regression lock for the subdir baseline-deletion bug. The approve flow
+  # can't run in CI (it needs a live PR + comment), and every smoke job above
+  # runs from working-directory: '.', so the frame mismatch escaped review. This
+  # job proves the underlying invariant directly: from a non-'.' working-
+  # directory, git's `<rev>:<path>` seed guard MUST carry a leading `./` to
+  # resolve cwd-relative — otherwise the head baselines are never seeded and the
+  # downstream prune deletes every unchanged baseline.
+  approve-subdir-frame:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Seed guard is cwd-relative (source lock)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The literal '$HEAD_SHA'/'$BASELINES_PATH' are the strings we grep for
+          # in the source, so the single quotes below are intentional (SC2016).
+          # The fixed, cwd-relative ('./'-prefixed) guard must be present...
+          # shellcheck disable=SC2016
+          if ! grep -Fq 'git cat-file -e "$HEAD_SHA:./$BASELINES_PATH"' approve/action.yml; then
+            echo "approve/action.yml is missing the cwd-relative ('./'-prefixed) seed guard." >&2
+            exit 1
+          fi
+          # ...and the buggy repo-root-relative form must NOT reappear.
+          # shellcheck disable=SC2016
+          if grep -Fq 'git cat-file -e "$HEAD_SHA:$BASELINES_PATH"' approve/action.yml; then
+            echo "approve/action.yml reintroduced the repo-root-relative seed guard (subdir data-loss bug)." >&2
+            exit 1
+          fi
+
+      - name: Seed guard resolves from a subdir working-directory (behavioral)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          repo="$(mktemp -d)"
+          cd "$repo"
+          git init -q
+          git config user.email ci@example.com
+          git config user.name ci
+
+          # Monorepo consumer: baselines live under a subdir (the working-directory).
+          bp="tuffgal/baselines"
+          mkdir -p "frontend/$bp/visit-home"
+          printf 'PNGDATA' > "frontend/$bp/visit-home/desktop.png"
+          git add -A
+          git commit -qm seed
+          sha="$(git rev-parse HEAD)"
+
+          # Replay the approve seed step from the subdir cwd. The `git archive`
+          # companion line is already cwd-relative; only the guard was wrong.
+          seed() { # $1 = the <rev>:<path> guard expression under test
+            rm -rf "$bp"; mkdir -p "$bp"
+            if git cat-file -e "$1" 2>/dev/null; then
+              git archive "$sha" -- "$bp" | tar -x
+            fi
+          }
+
+          cd "$repo/frontend"
+
+          # OLD guard (repo-root-relative): FALSE from a subdir, so the seed is
+          # skipped and the dir is left empty -> prune would wipe every baseline.
+          seed "$sha:$bp"
+          if find "$bp" -type f | grep -q .; then
+            echo "OLD guard unexpectedly seeded baselines; the bug is not being exercised." >&2
+            exit 1
+          fi
+
+          # NEW guard ('./'-prefixed, cwd-relative): TRUE, head baselines land
+          # under the subdir with their committed content.
+          seed "$sha:./$bp"
+          if [ "$(cat "$bp/visit-home/desktop.png")" != "PNGDATA" ]; then
+            echo "NEW guard failed to seed the head baseline from a subdir working-directory." >&2
+            find "$bp" -type f || true
+            exit 1
+          fi
+
+          # Default working-directory ('.'): the '.'-prefixed guard must still
+          # resolve at the repo root so the common case never regresses.
+          root="$(mktemp -d)"
+          cd "$root"
+          git init -q
+          git config user.email ci@example.com
+          git config user.name ci
+          mkdir -p "$bp/visit-home"
+          printf 'ROOT' > "$bp/visit-home/desktop.png"
+          git add -A
+          git commit -qm seed
+          rsha="$(git rev-parse HEAD)"
+          if ! git cat-file -e "$rsha:./$bp" 2>/dev/null; then
+            echo "'./'-prefixed guard failed for the default '.' working-directory (regression)." >&2
+            exit 1
+          fi
+
+          echo "subdir-frame: OLD guard skips the seed, NEW guard seeds, default '.' unaffected."
+
+  # Security lock for the seeded-baselines symlink-follow vector. The
+  # PR head tree is untrusted (a write collaborator controls it) and `git archive
+  # | tar -x` recreates any symlink committed under baselines; the commit step
+  # reads file bytes to blob them, so a followed symlink would exfiltrate its
+  # target (a secret) onto the PR branch. The apply step carries a fail-closed
+  # `find -type l` backstop right after extraction. The approve flow can't run in
+  # CI (needs a live PR + comment), so this job locks the guard's presence in
+  # source AND replays it behaviorally against a planted symlink.
+  approve-symlink-backstop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Symlink backstop is present in the apply step (source lock)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The literal '$BASELINES_PATH' is the string we grep for in source, so
+          # the single quotes below are intentional (SC2016).
+          # shellcheck disable=SC2016
+          if ! grep -Fq 'find "$BASELINES_PATH" -type l' approve/action.yml; then
+            echo "approve/action.yml is missing the fail-closed symlink backstop after seeding." >&2
+            exit 1
+          fi
+
+      - name: Backstop refuses a symlinked seeded tree (behavioral, both directions)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Mirrors the apply-step guard exactly: a symlink materialized under
+          # baselines must fail closed the moment the head tree is extracted.
+          guard() { # $1 = the seeded baselines dir under test
+            if find "$1" -type l | grep -q .; then
+              echo "Refusing symlink in seeded baselines" >&2
+              return 1
+            fi
+            return 0
+          }
+
+          # Direction 1 — a clean seeded tree of regular files passes.
+          clean="$(mktemp -d)"
+          mkdir -p "$clean/visit-home"
+          printf 'x' > "$clean/visit-home/0.png"
+          if ! guard "$clean"; then
+            echo "FAIL: clean seeded baselines were rejected" >&2; exit 1
+          fi
+
+          # Direction 2 — a tree carrying a symlink (as `git archive | tar -x`
+          # would recreate from a malicious head commit) must be refused.
+          evil="$(mktemp -d)"
+          mkdir -p "$evil/visit-home"
+          printf 'x' > "$evil/visit-home/0.png"
+          ln -s /etc/passwd "$evil/visit-home/leak.png"
+          if guard "$evil"; then
+            echo "FAIL: seeded baselines carrying a symlink were accepted" >&2; exit 1
+          fi
+
+          echo "symlink-backstop: clean tree passes, symlinked tree refused."
+
+  # Unit test for the parse step's no-results guard. A results.json that is
+  # missing OR malformed (empty, whitespace, truncated, not a JSON object) must
+  # route to the no-results contract and exit 0 — never crash the step on a jq
+  # parse error and leak unset outputs to the downstream always() steps. Pure
+  # jq-over-a-file, so this replays the guard directly (like approve-subdir-frame
+  # above) rather than needing a live harness run, and source-locks the guard so
+  # the replay can't silently drift from the action.
+  parse-malformed-results:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Parse step validates results.json before parsing (source lock)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The JSON-object validation must run before the first parsing jq...
+          if ! grep -Fq 'type == "object"' action.yml; then
+            echo "action.yml parse step must validate results.json is a JSON object before parsing." >&2
+            exit 1
+          fi
+          # ...and the emission must be factored so the missing-file and
+          # malformed-file cases share one identical no-results block.
+          if ! grep -Fq 'emit_no_results' action.yml; then
+            echo "action.yml parse step must factor the no-results emission (emit_no_results) shared by both branches." >&2
+            exit 1
+          fi
+
+      - name: Missing / empty / malformed results.json map to no-results, exit 0 (behavioral)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Mirrors the parse step's no-results guard (see action.yml "Parse
+          # harness outcome"): asserts the no-results OUTPUTS, not the summary
+          # text. The source-lock step above guards against the replay and the
+          # action silently diverging.
+          run_guard() { # $1 = report dir; writes the emitted outputs to $1/out
+            local results="$1/results.json"
+            local GITHUB_OUTPUT="$1/out"
+            local GITHUB_STEP_SUMMARY="$1/sum"
+            : > "$GITHUB_OUTPUT"
+            : > "$GITHUB_STEP_SUMMARY"
+            (
+              set -euo pipefail
+              emit_no_results() {
+                {
+                  echo "passed=0"
+                  echo "changed=0"
+                  echo "failed=0"
+                  echo "new=0"
+                  echo "deleted=0"
+                  echo "total=0"
+                  echo "env-mismatch=false"
+                  echo "pending=false"
+                  echo "outcome=no-results"
+                } >> "$GITHUB_OUTPUT"
+                {
+                  echo "## Tuffgal"
+                  echo ""
+                  echo "Harness produced no results.json."
+                } >> "$GITHUB_STEP_SUMMARY"
+              }
+              if [ ! -f "$results" ] || ! jq -e 'type == "object"' "$results" >/dev/null 2>&1; then
+                emit_no_results
+                exit 0
+              fi
+              echo "outcome=parsed" >> "$GITHUB_OUTPUT"
+            )
+          }
+
+          assert_no_results() { # $1 = label, $2 = report dir
+            local rc=0
+            run_guard "$2" || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "FAIL[$1]: guard exited $rc, expected 0 (a malformed file must not crash the step)." >&2
+              exit 1
+            fi
+            if ! grep -Fxq 'outcome=no-results' "$2/out"; then
+              echo "FAIL[$1]: expected outcome=no-results. Emitted:" >&2
+              cat "$2/out" >&2
+              exit 1
+            fi
+            if ! grep -Fxq 'passed=0' "$2/out"; then
+              echo "FAIL[$1]: expected the zeroed no-results counts. Emitted:" >&2
+              cat "$2/out" >&2
+              exit 1
+            fi
+            if ! grep -Fxq 'total=0' "$2/out"; then
+              echo "FAIL[$1]: expected the zeroed no-results counts. Emitted:" >&2
+              cat "$2/out" >&2
+              exit 1
+            fi
+            echo "ok[$1]: no-results, exit 0"
+          }
+
+          base="$(mktemp -d)"
+
+          # Missing file — the original no-results path.
+          d="$base/missing"; mkdir -p "$d"
+          assert_no_results "missing" "$d"
+
+          # Present but empty. A plain `jq empty` would accept this (0 inputs is
+          # valid) and let it fall through to the crash; `type == "object"`
+          # rejects it.
+          d="$base/empty"; mkdir -p "$d"; : > "$d/results.json"
+          assert_no_results "empty" "$d"
+
+          # Whitespace only — same trap as empty.
+          d="$base/whitespace"; mkdir -p "$d"; printf '   \n' > "$d/results.json"
+          assert_no_results "whitespace" "$d"
+
+          # Not JSON at all.
+          d="$base/garbage"; mkdir -p "$d"; printf 'not json' > "$d/results.json"
+          assert_no_results "garbage" "$d"
+
+          # Valid JSON but not an object (an array has no .totals to read).
+          d="$base/array"; mkdir -p "$d"; printf '[1,2,3]' > "$d/results.json"
+          assert_no_results "array" "$d"
+
+          # Control: a valid results.json object must FALL THROUGH the guard, not
+          # be swallowed as no-results — proves the guard can't over-trigger.
+          d="$base/valid"; mkdir -p "$d"
+          printf '{"totals":{"passed":1,"stories":1}}' > "$d/results.json"
+          rc=0
+          run_guard "$d" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "FAIL[valid]: guard exited $rc on a valid object." >&2
+            exit 1
+          fi
+          if grep -Fxq 'outcome=no-results' "$d/out"; then
+            echo "FAIL[valid]: a valid results.json was wrongly routed to no-results." >&2
+            cat "$d/out" >&2
+            exit 1
+          fi
+          echo "ok[valid]: a valid object falls through the guard"
+
+          # Regression proof: the parse tail's first jq exits non-zero on garbage
+          # (a plain parse error) — exactly the failure that, unguarded, kills the
+          # step under set -euo pipefail. This is why validation must run first.
+          rc=0
+          jq -r '.totals.passed // 0' "$base/garbage/results.json" >/dev/null 2>&1 || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "FAIL: the unguarded first jq did not fail on garbage; the guard's necessity is not being exercised." >&2
+            exit 1
+          fi
+          echo "regression-proof: the unguarded first jq exits $rc on garbage (the guard is load-bearing)."
+
+          echo "parse-malformed-results: all cases passed"

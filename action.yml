@@ -114,7 +114,7 @@ runs:
   using: composite
   steps:
     - name: Set up Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
       with:
         node-version: ${{ inputs.node-version }}
         cache: npm
@@ -172,7 +172,12 @@ runs:
       run: |
         set -euo pipefail
         results="$TUFFGAL_REPORT_PATH/results.json"
-        if [ ! -f "$results" ]; then
+
+        # Emit the no-results contract (zeroed counts + a no-results outcome) and
+        # the step summary, leaving the step SUCCESSFUL so downstream always()
+        # steps still see defined outputs. Shared by the missing-file and the
+        # malformed-JSON branches below so both emit an identical block.
+        emit_no_results() {
           {
             echo "passed=0"
             echo "changed=0"
@@ -189,6 +194,16 @@ runs:
             echo ""
             echo "Harness produced no \`results.json\`. Treating as failed."
           } >> "$GITHUB_STEP_SUMMARY"
+        }
+
+        # No results file, or a file that isn't a valid JSON object (empty,
+        # truncated, or otherwise malformed). Validate ONCE up front: without
+        # this, the first `jq` below runs against garbage, spews a parse error,
+        # and — with the later integer tests under `set -euo pipefail` — kills
+        # the step mid-way, leaking unset outputs to the always() steps. Route
+        # both cases to the same no-results contract and exit cleanly instead.
+        if [ ! -f "$results" ] || ! jq -e 'type == "object"' "$results" >/dev/null 2>&1; then
+          emit_no_results
           exit 0
         fi
 
@@ -268,7 +283,7 @@ runs:
 
     - name: Upload report
       if: always() && inputs.upload-artifacts == 'true' && (steps.outcome.outputs.failed != '0' || steps.outcome.outputs.pending == 'true' || steps.outcome.outputs.outcome == 'no-results')
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
         name: tuffgal-report
         path: ${{ inputs.working-directory }}/${{ inputs.report-path }}/
@@ -276,7 +291,7 @@ runs:
 
     - name: Upload candidates
       if: always() && inputs.upload-artifacts == 'true' && steps.outcome.outputs.pending == 'true'
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
         name: tuffgal-candidates
         path: ${{ inputs.working-directory }}/${{ inputs.report-path }}/candidates/
@@ -286,13 +301,18 @@ runs:
     # report + individual PNGs instead of a zip. The report references baselines
     # as `../baselines/…`, so both trees are staged as siblings under `pr-<n>/`
     # (report/ + baselines/) to keep those relative image srcs resolving exactly
-    # as they do locally. Best-effort: any failure (no contents:write, Pages
-    # off, private repo) logs a warning and leaves preview-url empty, and the
-    # comment falls back to artifact-download links. Never fails the job.
+    # as they do locally. Concurrent visual runs on DIFFERENT PRs share this one
+    # branch; each replaces only its own `pr-<n>/` subtree, so a second push
+    # rejected non-fast-forward just needs the advanced tip re-synced and this
+    # PR's (idempotent) subtree re-applied — the push is retried a couple of
+    # times before falling back. Best-effort: an exhausted retry, or any
+    # terminal failure (no contents:write, Pages off, private repo), logs a
+    # warning and leaves preview-url empty, and the comment falls back to
+    # artifact-download links. Never fails the job.
     - name: Publish per-PR preview to GitHub Pages
       id: pages
       if: always() && github.event_name == 'pull_request' && inputs.pages-preview == 'true' && steps.outcome.outputs.pending == 'true'
-      uses: actions/github-script@v7
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
       env:
         TUFFGAL_REPORT_PATH: ${{ inputs.report-path }}
         TUFFGAL_BASELINES_PATH: ${{ inputs.baselines-path }}
@@ -304,6 +324,13 @@ runs:
         # Defaults to GITHUB_TOKEN (pushes fine, cannot create the Pages site);
         # a PAT/App token with admin lets createPagesSite auto-enable Pages.
         GITHUB_TOKEN: ${{ inputs.pages-token }}
+        # This composite's own action dir. `github.action_path` is only supported
+        # in composite actions and is evaluated HERE in the composite's context;
+        # it is NOT the same as `GITHUB_ACTION_PATH` inside the nested github-
+        # script step below, which points at github-script's own action dir. The
+        # script requires the push-retry decision from this path. (Source-locked
+        # by ci.yml pages-push-require-source-lock.)
+        ACTION_PATH: ${{ github.action_path }}
       with:
         github-token: ${{ inputs.pages-token }}
         script: |
@@ -324,17 +351,15 @@ runs:
           const remote = `https://x-access-token:${token}@github.com/${owner}/${repo}.git`;
           const work = path.join(process.env.RUNNER_TEMP, 'tuffgal-pages');
 
-          // 1. Publish this PR's subtree to the pages branch FIRST. The branch
-          //    must exist before Pages can be pointed at it — resolving/enabling
-          //    Pages before the push would deadlock a fresh repo (you cannot
-          //    select a source branch that does not exist yet). A push failure
-          //    (no contents:write) aborts with an empty preview-url, so the
-          //    comment falls back to artifact links.
-          try {
+          const prDir = path.join(work, `pr-${prNumber}`);
+
+          // Build a fresh local clone of the preview branch: shallow-clone the
+          // existing branch, or start an orphan for the first-ever preview. Run
+          // again on a retry so a push that raced a concurrent PR re-clones the
+          // now-existing branch (the race advanced its tip) instead of re-orphaning.
+          const syncClone = () => {
             fs.rmSync(work, { recursive: true, force: true });
             fs.mkdirSync(work, { recursive: true });
-            // Shallow-clone the existing preview branch, or start an orphan so
-            // the first-ever preview carries no unrelated repo history.
             try {
               run('git', ['clone', '--depth', '1', '--branch', branch, remote, work]);
             } catch {
@@ -344,18 +369,20 @@ runs:
             }
             run('git', ['-C', work, 'config', 'user.name', process.env.GIT_USER_NAME]);
             run('git', ['-C', work, 'config', 'user.email', process.env.GIT_USER_EMAIL]);
+          };
 
-            // Replace only THIS PR's subtree; other PRs' previews are untouched.
-            // report/ + baselines/ stage as siblings so the report's
-            // `../baselines/…` image srcs resolve on Pages as they do locally.
-            const prDir = path.join(work, `pr-${prNumber}`);
+          // Replace only THIS PR's subtree; other PRs' previews are untouched.
+          // report/ + baselines/ stage as siblings so the report's
+          // `../baselines/…` image srcs resolve on Pages as they do locally. The
+          // op is idempotent, so re-applying it onto a freshly re-synced tip is
+          // safe on a retry.
+          const applySubtree = () => {
             fs.rmSync(prDir, { recursive: true, force: true });
             fs.mkdirSync(path.join(prDir, 'report'), { recursive: true });
             fs.cpSync(reportAbs, path.join(prDir, 'report'), { recursive: true });
             if (fs.existsSync(baselinesAbs)) {
               fs.cpSync(baselinesAbs, path.join(prDir, 'baselines'), { recursive: true });
             }
-
             run('git', ['-C', work, 'add', '-A']);
             // `git commit` exits non-zero when nothing changed; treat as a no-op.
             try {
@@ -363,7 +390,45 @@ runs:
             } catch (e) {
               if (!/nothing to commit/.test(String((e && e.stdout) || '') + String((e && e.stderr) || ''))) throw e;
             }
-            run('git', ['-C', work, 'push', '-q', 'origin', `HEAD:refs/heads/${branch}`]);
+          };
+
+          const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+          // 1. Publish this PR's subtree to the pages branch FIRST. The branch
+          //    must exist before Pages can be pointed at it — resolving/enabling
+          //    Pages before the push would deadlock a fresh repo (you cannot
+          //    select a source branch that does not exist yet).
+          //
+          //    Two visual runs on different PRs share this branch, so a push can
+          //    be rejected non-fast-forward even though the two subtrees are
+          //    disjoint; re-sync the advanced tip, re-apply this PR's subtree,
+          //    and retry a few times. A terminal failure (no contents:write) or
+          //    an exhausted retry aborts with an empty preview-url, so the
+          //    comment falls back to artifact links.
+          try {
+            // The PURE retryable-vs-terminal push classifier lives in a committed,
+            // unit-tested module (scripts/pages-push.js + the pages-push-retry-unit
+            // CI job); only the git side effects stay inline here. Required INSIDE
+            // this never-fail block so even a module-load failure degrades to the
+            // artifact-link fallback rather than failing the step.
+            const { isRetryablePushError } = require(`${process.env.ACTION_PATH}/scripts/pages-push.js`);
+            const maxAttempts = 3;
+            for (let attempt = 1; ; attempt++) {
+              syncClone();
+              applySubtree();
+              try {
+                run('git', ['-C', work, 'push', '-q', 'origin', `HEAD:refs/heads/${branch}`]);
+                break;
+              } catch (error) {
+                const detail =
+                  String((error && error.stdout) || '') + String((error && error.stderr) || '') + String((error && error.message) || '');
+                // A non-fast-forward means a concurrent PR advanced the shared
+                // tip — re-sync and re-apply. A permission failure never recovers.
+                if (attempt >= maxAttempts || !isRetryablePushError(detail)) throw error;
+                core.info(`Pages preview push rejected (attempt ${attempt}/${maxAttempts}); re-syncing the ${branch} tip and retrying.`);
+                await sleep(attempt * 500);
+              }
+            }
           } catch (e) {
             core.warning(`Could not push the per-PR Pages preview (need contents: write?): ${e.message}. The comment will fall back to artifact-download links.`);
             core.setOutput('preview-url', '');
@@ -411,7 +476,7 @@ runs:
 
     - name: Post sticky PR comment
       if: always() && github.event_name == 'pull_request'
-      uses: actions/github-script@v7
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
       env:
         TUFFGAL_REPORT_PATH: ${{ inputs.report-path }}
         TUFFGAL_BASELINES_PATH: ${{ inputs.baselines-path }}

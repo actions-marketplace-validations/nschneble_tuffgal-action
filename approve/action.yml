@@ -55,7 +55,13 @@ runs:
     # ------------------------------------------------------------------ #
     - name: Gate on permission + resolve PR
       id: gate
-      uses: actions/github-script@v7
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+      env:
+        # This composite's own action dir, evaluated in the composite context (see
+        # the commit step's ACTION_PATH note). The script requires resolve-approver.js
+        # from here — NOT via GITHUB_ACTION_PATH, which inside a nested github-script
+        # step points at github-script's own dir.
+        ACTION_PATH: ${{ github.action_path }}
       with:
         script: |
           const { owner, repo } = context.repo;
@@ -65,36 +71,28 @@ runs:
           // Defense in depth: re-validate the trigger even though the calling
           // workflow already filtered. The body never reaches a shell.
           //
-          // TWO trigger shapes resolve to the same approve, differing only in WHO
-          // the approver is:
-          //   - mention: a human comments `@tuffgal approve` → approver is the
-          //     comment AUTHOR (`comment.user.login`).
-          //   - checkbox: a human TICKS the approve box in the bot's sticky
-          //     report comment (`issue_comment: edited`). The comment author is
-          //     the bot, so the approver is the EDITOR — `context.actor`. We
-          //     recognize it by the report + approve-box markers with the box
-          //     CHECKED (`[x]`), and ignore the bot's own edits (e.g. the visual
-          //     workflow refreshing the sticky comment with an UNchecked box) so
-          //     a comment update never loops back into an approval.
-          const body = String(comment && comment.body || '');
-          const isMention = /(^|\s)@tuffgal\s+approve(\s|$)/i.test(body);
-          const isCheckedBox =
-            context.eventName === 'issue_comment' &&
-            context.payload.action === 'edited' &&
-            /<!--\s*tuffgal-report\s*-->/.test(body) &&
-            /-\s*\[[xX]\]\s*<!--\s*tuffgal-approve-box\s*-->/.test(body);
-          const actor = isMention ? (comment && comment.user && comment.user.login) : context.actor;
+          // The PURE trigger/actor decision — which of the two approve shapes
+          // fired (mention vs. ticked checkbox), who the approver is, and the
+          // fail-closed early-outs (not a PR, neither trigger, bot-authored edit)
+          // — lives in a committed, unit-tested module. The API-bound pieces
+          // (reaction, permission lookup, fork decline) stay inline below. See
+          // resolve-approver.js and the approve-scripts-unit CI job.
+          const { resolveApprover } = require(`${process.env.ACTION_PATH}/scripts/resolve-approver.js`);
+          const { proceed, actor, reason } = resolveApprover({
+            eventName: context.eventName,
+            action: context.payload.action,
+            comment,
+            issue,
+            contextActor: context.actor,
+          });
 
-          if (!issue || !issue.pull_request || (!isMention && !isCheckedBox)) {
-            core.info('Comment is not a @tuffgal approve or a ticked approve box on a PR; nothing to do.');
-            core.setOutput('proceed', 'false');
-            return;
-          }
-          // A bot-authored edit of the sticky comment fires `edited` too (e.g. the
-          // visual workflow refreshing it) — never treat that as an approval, and
-          // never react on it.
-          if (!actor || /\[bot\]$/.test(actor)) {
-            core.info(`Ignoring edit by '${actor}'.`);
+          if (!proceed) {
+            // 'ignored-actor' is a bot-authored edit (e.g. the visual workflow
+            // refreshing the sticky comment) or a missing actor — never react on
+            // it. 'no-trigger' is a non-PR comment or neither approve shape.
+            core.info(reason === 'ignored-actor'
+              ? `Ignoring edit by '${actor}'.`
+              : 'Comment is not a @tuffgal approve or a ticked approve box on a PR; nothing to do.');
             core.setOutput('proceed', 'false');
             return;
           }
@@ -165,14 +163,14 @@ runs:
     # ------------------------------------------------------------------ #
     - name: Checkout default branch (trusted)
       if: steps.gate.outputs.proceed == 'true'
-      uses: actions/checkout@v4
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       with:
         ref: ${{ github.event.repository.default_branch }}
         fetch-depth: 1
 
     - name: Set up Node.js
       if: steps.gate.outputs.proceed == 'true'
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
       with:
         node-version: ${{ inputs.node-version }}
         cache: npm
@@ -192,11 +190,14 @@ runs:
     - name: Download candidates artifact
       id: download
       if: steps.gate.outputs.proceed == 'true'
-      uses: actions/github-script@v7
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
       env:
         HEAD_SHA: ${{ steps.gate.outputs.head_sha }}
         PR_NUMBER: ${{ steps.gate.outputs.pr_number }}
         ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        # This composite's own action dir (see the commit step's ACTION_PATH note).
+        # The script requires select-candidate.js from here.
+        ACTION_PATH: ${{ github.action_path }}
       with:
         script: |
           const fs = require('fs');
@@ -205,26 +206,35 @@ runs:
           const headSha = process.env.HEAD_SHA;
           const artifactName = process.env.ARTIFACT_NAME;
 
+          // The PURE selection decision — newest-run-first ordering and the
+          // per-run match classification (single → select, >1 → fail closed
+          // ambiguous, 0 → none) — lives in a committed, unit-tested module. The
+          // `github.paginate` fetches and the createComment / setFailed side
+          // effects stay inline; the run-by-run fetch below stays LAZY, stopping
+          // at the first run with a match. See select-candidate.js.
+          const { sortRunsNewestFirst, classifyMatches } =
+            require(`${process.env.ACTION_PATH}/scripts/select-candidate.js`);
+
           // Newest completed run for this head SHA that carries the artifact.
           const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
             owner, repo, head_sha: headSha, status: 'completed', per_page: 100,
           });
-          runs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+          const runsNewestFirst = sortRunsNewestFirst(runs);
 
           // Iterate newest-first; the first run carrying at least one match is
           // the selected run. Ambiguity WITHIN that run (a matrix / smoke suite
           // that uploads multiple same-named artifacts) is an error, not a
           // coin flip: fail closed rather than promote an arbitrary set.
           let artifact = null;
-          for (const run of runs) {
+          for (const run of runsNewestFirst) {
             const arts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
               owner, repo, run_id: run.id, per_page: 100,
             });
-            const matches = arts.filter(a => a.name === artifactName && !a.expired);
-            if (matches.length === 0) continue;
-            if (matches.length > 1) {
+            const result = classifyMatches(arts, artifactName);
+            if (result.kind === 'none') continue;
+            if (result.kind === 'ambiguous') {
               const guidance = [
-                `Run ${run.id} carries ${matches.length} artifacts named \`${artifactName}\`, so promoting one would be arbitrary.`,
+                `Run ${run.id} carries ${result.count} artifacts named \`${artifactName}\`, so promoting one would be arbitrary.`,
                 'Set a unique `artifact-name` per visual job (matrix / smoke suites), or run a single visual job per workflow, then re-comment `@tuffgal approve`.',
               ];
               await github.rest.issues.createComment({
@@ -234,7 +244,7 @@ runs:
               core.setFailed(guidance.join(' '));
               return;
             }
-            artifact = matches[0];
+            artifact = result.artifact;
             break;
           }
           if (!artifact) {
@@ -256,7 +266,7 @@ runs:
 
     - name: No candidates found
       if: steps.gate.outputs.proceed == 'true' && steps.download.outputs.found != 'true'
-      uses: actions/github-script@v7
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
       env:
         PR_NUMBER: ${{ steps.gate.outputs.pr_number }}
       with:
@@ -294,17 +304,18 @@ runs:
 
     # ------------------------------------------------------------------ #
     # 5. Preflight the trusted default-branch CLI for `approve --from`    #
-    #    support BEFORE we invoke it. A pre-v2 tuffgal has no `--from`,   #
-    #    silently falls through to a plain `approve`, and dies with a     #
-    #    cryptic "no prior run" error. We probe the CLI's own help text   #
-    #    for the flag (robust across prerelease version ordering) and, if #
-    #    it's missing, post a pointed comment and fail. Gated identically #
-    #    to the apply step so a stale-tuffgal repo with NO candidates     #
-    #    still gets the friendlier "No candidates found" path, not this.  #
+    #    support BEFORE we invoke it. A tuffgal older than                #
+    #    `0.2.0-alpha.1` has no `--from`, silently falls through to a     #
+    #    plain `approve`, and dies with a cryptic "no prior run" error.   #
+    #    We probe the CLI's own help text for the flag (robust across     #
+    #    prerelease version ordering) and, if it's missing, post a        #
+    #    pointed comment and fail. Gated identically to the apply step so #
+    #    a stale-tuffgal repo with NO candidates still gets the           #
+    #    friendlier "No candidates found" path, not this.                 #
     # ------------------------------------------------------------------ #
     - name: Preflight tuffgal supports approve --from
       if: steps.gate.outputs.proceed == 'true' && steps.download.outputs.found == 'true'
-      uses: actions/github-script@v7
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
       env:
         WORKDIR: ${{ inputs.working-directory }}
         PR_NUMBER: ${{ steps.gate.outputs.pr_number }}
@@ -315,9 +326,10 @@ runs:
 
           // Probe the ACTUAL CLI surface, not a version string. `tuffgal help`
           // prints its full usage (and returns before loading any config), so a
-          // build that supports `approve --from` lists the flag and a pre-v2
-          // build does not. This dodges the prerelease-ordering trap where a
-          // naive semver string compare ranks `-alpha.10` below `-alpha.2`.
+          // build that supports `approve --from` lists the flag and a build
+          // predating `0.2.0-alpha.1` does not. This dodges the
+          // prerelease-ordering trap where a naive semver string compare
+          // ranks `-alpha.10` below `-alpha.2`.
           // Runs the same trusted base deps `npm ci` installed and the apply
           // step invokes — no head-branch code is executed.
           let help = '';
@@ -344,7 +356,7 @@ runs:
               '<!-- tuffgal-approve -->',
               '🧭 The tuffgal pinned on this repo\'s default branch predates `approve --from`, so the bot can\'t promote candidate baselines from here.',
               '',
-              'Land the tuffgal dependency bump (v2+) on the default branch, then comment `@tuffgal approve` again.',
+              'Land the tuffgal dependency bump (`>= 0.2.0-alpha.1`) on the default branch, then comment `@tuffgal approve` again.',
             ].join('\n'),
           });
           core.setFailed('Installed tuffgal does not support `approve --from`; bump tuffgal on the default branch.');
@@ -372,8 +384,32 @@ runs:
         git fetch --no-tags --depth=1 origin "$HEAD_SHA"
         rm -rf "$BASELINES_PATH"
         mkdir -p "$BASELINES_PATH"
-        if git cat-file -e "$HEAD_SHA:$BASELINES_PATH" 2>/dev/null; then
+        # BASELINES_PATH is working-directory-relative (this step runs with
+        # working-directory: inputs.working-directory). git's `<rev>:<path>`
+        # syntax is repo-root-relative and ignores cwd, so the leading `./` is
+        # load-bearing: it makes the guard cwd-relative to match the (already
+        # cwd-relative) `git archive` pathspec below. Without it a subdir
+        # consumer's guard is always FALSE, the head baselines are never seeded,
+        # and the downstream prune deletes every unchanged baseline. Locked by
+        # ci.yml `approve-subdir-frame`.
+        if git cat-file -e "$HEAD_SHA:./$BASELINES_PATH" 2>/dev/null; then
           git archive "$HEAD_SHA" -- "$BASELINES_PATH" | tar -x
+        fi
+
+        # Belt-and-suspenders symlink refusal. The head tree is UNTRUSTED (a
+        # write collaborator controls its committed contents) and the extraction
+        # above faithfully recreates any symlink committed under baselines. The
+        # downstream commit step reads each file's bytes to blob them, so a
+        # symlink pointing at a secret (../../.npmrc, /proc/self/environ) would
+        # exfiltrate the target onto the PR branch. Refuse fail-closed the moment
+        # the tree is materialized, before the CLI runs — mirrors
+        # validate-artifact.sh pass 1 for the sibling untrusted input. The
+        # commit step's walk() enforces the same invariant in Node; this is the
+        # earlier, independent layer. (Locked by ci.yml approve-symlink-backstop.)
+        seeded_links="$(find "$BASELINES_PATH" -type l)"
+        if [ -n "$seeded_links" ]; then
+          echo "Refusing symlink in seeded baselines: $seeded_links" >&2
+          exit 1
         fi
 
         # CLI owns baseline promotion, prune, and manifest.json.
@@ -394,7 +430,7 @@ runs:
     # ------------------------------------------------------------------ #
     - name: Commit baselines to PR head branch
       if: steps.gate.outputs.proceed == 'true' && steps.download.outputs.found == 'true'
-      uses: actions/github-script@v7
+      uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
       env:
         WORKDIR: ${{ inputs.working-directory }}
         BASELINES_PATH: ${{ inputs.baselines-path }}
@@ -407,6 +443,13 @@ runs:
         # 'true'/'false' string from a GitHub-expression comparison; the token
         # value itself never reaches the environment or the logs.
         TOKEN_IS_DEFAULT: ${{ inputs.token == github.token }}
+        # This composite's own action dir. `github.action_path` is only supported
+        # in composite actions and is evaluated HERE in the composite's context;
+        # it is NOT the same as `GITHUB_ACTION_PATH` inside the nested github-
+        # script step below, which points at github-script's own action dir.
+        # The script requires baseline-tree.js from this path. (Source-locked by
+        # ci.yml approve-require-source-lock.)
+        ACTION_PATH: ${{ github.action_path }}
       with:
         github-token: ${{ inputs.token }}
         script: |
@@ -414,6 +457,16 @@ runs:
           const path = require('path');
           const { execFileSync } = require('child_process');
           const { owner, repo } = context.repo;
+
+          // The PURE, security-sensitive logic — the out-of-scope/traversal path
+          // `guard`, the recursive file `walk`, the `toRepoPath` frame re-anchor,
+          // and the `computeDeletions` (atHead \ onDisk) set-difference — lives in
+          // a committed, unit-tested module. The thin GitHub git-data API calls
+          // (createBlob / createTree / createCommit / updateRef) and the
+          // `git ls-tree` below stay inline. See the module header and the
+          // `approve-scripts-unit` CI job.
+          const { walk, toRepoPath, computeDeletions, deriveFrames, BaselineScopeError } =
+            require(`${process.env.ACTION_PATH}/scripts/baseline-tree.js`);
 
           const workdir = process.env.WORKDIR || '.';
           const baselinesRel = process.env.BASELINES_PATH;              // working-directory-relative (matches the input contract)
@@ -423,40 +476,17 @@ runs:
 
           // Baselines prefix in two frames: repo-root-relative (for tree entries
           // and the guard) and working-directory-relative (for git pathspecs,
-          // which git resolves against the process cwd).
-          const workdirPrefix = workdir === '.' ? '' : workdir.replace(/\\/g, '/').replace(/\/$/, '');
-          const baselinesRelPosix = baselinesRel.replace(/\\/g, '/').replace(/\/$/, '');
-          const prefix = path.posix.join(workdirPrefix, baselinesRelPosix).replace(/\/$/, '');
+          // which git resolves against the process cwd). Derived + unit-tested in
+          // the module so the '.', subdir, and trailing-slash cases are locked.
+          const { workdirPrefix, baselinesRelPosix, prefix } = deriveFrames(workdir, baselinesRel);
 
-          const guard = (p) => {
-            const norm = p.replace(/\\/g, '/');
-            if (norm.startsWith('/') || norm.split('/').includes('..')) {
-              throw new Error(`Refusing out-of-scope path: ${p}`);
-            }
-            if (!(norm === prefix || norm.startsWith(prefix + '/'))) {
-              throw new Error(`Refusing path outside baselines directory: ${p}`);
-            }
-            return norm;
-          };
-
-          // Files currently on disk under baselines (post-approve desired state).
-          const walk = (d) => {
-            const out = [];
-            if (!fs.existsSync(d)) return out;
-            for (const name of fs.readdirSync(d)) {
-              const full = path.join(d, name);
-              const st = fs.statSync(full);
-              if (st.isDirectory()) out.push(...walk(full));
-              else out.push(full);
-            }
-            return out;
-          };
-          // Re-anchor to the repo-root frame (workdirPrefix + workdir-relative
-          // path) so onDisk, atHead, prefix, and the git-tree API all agree —
-          // correct for both working-directory '.' and a subdir.
-          const onDisk = walk(baselinesAbs).map(f => {
-            const rel = path.relative(workdir, f).split(path.sep).join('/');
-            return { repoPath: guard(path.posix.join(workdirPrefix, rel)), absPath: f };
+          // Files currently on disk under baselines (post-approve desired state),
+          // each re-anchored to the repo-root frame via toRepoPath so onDisk,
+          // atHead, prefix, and the git-tree API all agree — correct for both
+          // working-directory '.' and a subdir.
+          const onDisk = walk(baselinesAbs, fs).map(file => {
+            const rel = path.relative(workdir, file).split(path.sep).join('/');
+            return { repoPath: toRepoPath(rel, workdirPrefix, prefix), absPath: file };
           });
 
           // Files under baselines at the head commit (to compute deletions).
@@ -467,31 +497,34 @@ runs:
             const listed = execFileSync('git', ['ls-tree', '-r', '--name-only', headSha, '--', baselinesRelPosix], {
               cwd: workdir, encoding: 'utf8',
             });
-            atHead = listed.split('\n').map(s => s.trim()).filter(Boolean)
-              .map(name => guard(path.posix.join(workdirPrefix, name)));
-          } catch (e) {
-            core.info(`No baselines at head (${e.message}); treating as bootstrap.`);
+            atHead = listed.split('\n').map(name => name.trim()).filter(Boolean)
+              .map(name => toRepoPath(name, workdirPrefix, prefix));
+          } catch (error) {
+            // A scope rejection on a head-listed path is a security signal, not a
+            // bootstrap: re-throw it so it fail-closes. Only the genuine "no tree
+            // at head" ls-tree error is swallowed as bootstrap.
+            if (error instanceof BaselineScopeError) throw error;
+            core.info(`No baselines at head (${error.message}); treating as bootstrap.`);
           }
 
-          const onDiskSet = new Set(onDisk.map(f => f.repoPath));
-          const deletions = atHead.filter(p => !onDiskSet.has(p));
+          const deletions = computeDeletions(onDisk.map(file => file.repoPath), atHead);
 
           // Build tree entries: blobs for present files, null-sha deletions.
           // Blob creation is a content-generating POST per file; a real baseline
           // set is 100+ files and a tight loop trips GitHub's secondary rate
           // limit. Pace to ~1 request/second (GitHub's documented guidance) and
           // retry 403/429 honoring Retry-After.
-          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
           const createBlobPaced = async (payload) => {
             for (let attempt = 0; ; attempt++) {
               try {
                 return await github.rest.git.createBlob(payload);
-              } catch (e) {
-                const status = e.status;
+              } catch (error) {
+                const status = error.status;
                 const retryable = (status === 403 || status === 429) && attempt < 5;
-                if (!retryable) throw e;
+                if (!retryable) throw error;
                 const retryAfter =
-                  Number(e.response && e.response.headers && e.response.headers['retry-after']) ||
+                  Number(error.response && error.response.headers && error.response.headers['retry-after']) ||
                   Math.min(120, 15 * 2 ** attempt);
                 core.info(`Rate limited creating blob; waiting ${retryAfter}s (attempt ${attempt + 1}/5).`);
                 await sleep(retryAfter * 1000);
@@ -499,16 +532,16 @@ runs:
             }
           };
           const tree = [];
-          for (const f of onDisk) {
-            const content = fs.readFileSync(f.absPath);
+          for (const file of onDisk) {
+            const content = fs.readFileSync(file.absPath);
             const blob = await createBlobPaced({
               owner, repo, content: content.toString('base64'), encoding: 'base64',
             });
-            tree.push({ path: f.repoPath, mode: '100644', type: 'blob', sha: blob.data.sha });
+            tree.push({ path: file.repoPath, mode: '100644', type: 'blob', sha: blob.data.sha });
             await sleep(1000);
           }
-          for (const p of deletions) {
-            tree.push({ path: p, mode: '100644', type: 'blob', sha: null });
+          for (const deletionPath of deletions) {
+            tree.push({ path: deletionPath, mode: '100644', type: 'blob', sha: null });
           }
 
           if (tree.length === 0) {
@@ -535,8 +568,8 @@ runs:
             await github.rest.git.updateRef({
               owner, repo, ref: `heads/${headRef}`, sha: commit.data.sha, force: false,
             });
-          } catch (e) {
-            core.setFailed(`Could not fast-forward heads/${headRef}: ${e.message}. The branch may have moved; re-run approval.`);
+          } catch (error) {
+            core.setFailed(`Could not fast-forward heads/${headRef}: ${error.message}. The branch may have moved; re-run approval.`);
             return;
           }
 
