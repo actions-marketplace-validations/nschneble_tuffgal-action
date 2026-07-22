@@ -126,11 +126,11 @@ jobs:
   # `GITHUB_ACTION_PATH` resolves to a nonexistent path and crashes the step at
   # runtime. The comment-gated approve flow can't run in CI, so this job is the
   # only tripwire against the require-blocker regression: it locks the
-  # documented-correct idiom in source for all three approve modules —
-  # baseline-tree.js (commit step), resolve-approver.js (permission gate), and
-  # select-candidate.js (download step) — asserting the composite passes its
-  # `github.action_path` through the step env as ACTION_PATH and each script
-  # requires from that.
+  # documented-correct idiom in source for all four approve modules —
+  # baseline-tree.js (commit step), resolve-approver.js (permission gate),
+  # select-candidate.js (download step), and filter-candidates.js (per-baseline
+  # filter step) — asserting the composite passes its `github.action_path`
+  # through the step env as ACTION_PATH and each script requires from that.
   approve-require-source-lock:
     runs-on: ubuntu-latest
     steps:
@@ -153,7 +153,7 @@ jobs:
           # shellcheck disable=SC2016
           good_suffix='.js`)'
           bad_prefix='process.env.GITHUB_ACTION_PATH}/scripts/'
-          for mod in baseline-tree resolve-approver select-candidate; do
+          for mod in baseline-tree resolve-approver select-candidate filter-candidates; do
             if ! grep -Fq "${good_prefix}${mod}${good_suffix}" approve/action.yml; then
               echo "approve/action.yml must require $mod.js via process.env.ACTION_PATH." >&2
               exit 1
@@ -689,6 +689,43 @@ jobs:
           fi
 
           echo "symlink-backstop: clean tree passes, symlinked tree refused."
+
+  # Source lock for the example approve workflow's trigger condition. The `if:`
+  # pre-filter in examples/tuffgal-approve.yml must fire for BOTH a ticked master
+  # "approve all" box AND a ticked per-story item box — a partial approve (an
+  # item box ticked, the master box untouched) is a legitimate trigger shape.
+  # This feature's approve wave fixed exactly that bug: the condition previously
+  # matched the master box only, so a partial-only approve never fired the
+  # workflow at all. A future edit could silently re-narrow the condition back to
+  # master-only and no `node --test` suite could catch it — GitHub Actions `if:`
+  # expressions aren't executable-testable — so this job is the only tripwire
+  # against that regression. It asserts all four ticked-box literals ([x]/[X] for
+  # both the master approve-box and the per-story approve-item) survive in source.
+  approve-example-trigger-source-lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Example approve trigger fires for master AND per-story boxes (source lock)
+        shell: bash
+        run: |
+          set -euo pipefail
+          example="examples/tuffgal-approve.yml"
+          # Both the master approve-box check and the per-story approve-item check
+          # must be present, in both the lower- and upper-case ticked forms. The
+          # approve-item arms are the fix; dropping them re-narrows the trigger to
+          # master-only — the exact partial-approve bug that shipped a workflow
+          # which never fired for a per-story approval.
+          for marker in \
+            '[x] <!-- tuffgal-approve-box' \
+            '[X] <!-- tuffgal-approve-box' \
+            '[x] <!-- tuffgal-approve-item:' \
+            '[X] <!-- tuffgal-approve-item:'; do
+            if ! grep -Fq "$marker" "$example"; then
+              echo "$example if: condition is missing the '$marker' check — the approve trigger may have been re-narrowed (partial-approve regression)." >&2
+              exit 1
+            fi
+          done
+          echo "approve-example-trigger-source-lock: master + per-story approve boxes both locked in the trigger condition."
 
   # Unit test for the parse step's no-results guard. A results.json that is
   # missing OR malformed (empty, whitespace, truncated, not a JSON object) must
