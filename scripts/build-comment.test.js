@@ -5,6 +5,8 @@
 //
 const { test } = require("node:test");
 const assert = require("node:assert");
+const fs = require("node:fs");
+const path = require("node:path");
 
 const {
   buildCommentBody,
@@ -12,6 +14,14 @@ const {
   renderTotalsTable,
   approveItemMarker,
 } = require("./build-comment.js");
+
+// Cross-package require is fine in a test file — it runs from the repo root and
+// this is compile-time verification, never a runtime cross-package require. We
+// feed a rendered (multi-breakpoint, suffixed) checkbox line through the ACTUAL
+// approve-trigger parser to prove the breakpoint suffix stays invisible to it.
+const {
+  resolveApprover,
+} = require("../approve/scripts/resolve-approver.js");
 
 // A baseline set of args. Individual tests override only what they exercise so
 // the branch under test is isolated from the rest of the body.
@@ -30,9 +40,17 @@ const base = () => ({
   previewUrl: "",
   changed: [],
   added: [],
-  deletedNames: [],
+  deleted: [],
+  failed: [],
+  multiBreakpoint: false,
   runUrl: "https://github.com/o/r/actions/runs/1",
 });
+
+// A single-breakpoint changed shot: one entry, no breakpoint name — the shape
+// action.yml emits for a single-config run.
+const changedShot = (baseline, actual) => [{ breakpoint: undefined, baseline, actual }];
+// A single-breakpoint new shot: actual only (no prior baseline exists yet).
+const newShot = (actual) => [{ breakpoint: undefined, actual }];
 
 test("every body opens with the sticky marker so the upsert can find it", () => {
   const body = buildCommentBody(base());
@@ -106,9 +124,7 @@ test("changed stories without a preview still render a per-item approve checkbox
       {
         index: 0,
         name: "Home page",
-        baseline: null,
-        actual: null,
-        diff: null,
+        shots: changedShot(null, null),
         actionKeys: ["home"],
       },
     ],
@@ -127,7 +143,7 @@ test("changed stories without a preview still render a per-item approve checkbox
   assert.doesNotMatch(body, /Open the full report/);
 });
 
-test("changed stories with a preview render thumbnails, a deep link, and name-bearing alt text", () => {
+test("changed stories with a preview render a two-column table, a deep link, and name-bearing alt text", () => {
   const body = buildCommentBody({
     ...base(),
     outcome: "changed",
@@ -137,17 +153,23 @@ test("changed stories with a preview render thumbnails, a deep link, and name-be
       {
         index: 2,
         name: "Login form",
-        baseline: "https://pages.example/pr-7/baselines/login.png",
-        actual: "https://pages.example/pr-7/report/login.png",
-        diff: "https://pages.example/pr-7/report/login.diff.png",
+        shots: changedShot(
+          "https://pages.example/pr-7/baselines/login.png",
+          "https://pages.example/pr-7/report/login.png"
+        ),
       },
     ],
   });
   assert.match(body, /<summary>Login form<\/summary>/);
+  // The single-breakpoint table is baseline | actual only — no Breakpoint
+  // column, no Diff column; the full diff still lives in the linked report.
+  assert.match(body, /^\| Baseline \| Actual \|$/m);
+  assert.doesNotMatch(body, /\| Baseline \| Actual \| Diff \|/);
+  assert.doesNotMatch(body, /Breakpoint/);
   // Alt text threads the story name for per-image screen-reader context.
   assert.match(body, /alt="baseline for Login form"/);
   assert.match(body, /alt="actual for Login form"/);
-  assert.match(body, /alt="diff for Login form"/);
+  assert.doesNotMatch(body, /alt="diff for Login form"/);
   assert.match(
     body,
     /<img src="https:\/\/pages\.example\/pr-7\/baselines\/login\.png"/
@@ -164,9 +186,7 @@ test("a missing image URL renders an unavailable placeholder, not a broken img",
     outcome: "changed",
     counts: { ...base().counts, changed: "1", total: "1" },
     previewUrl: "https://pages.example/pr-7",
-    changed: [
-      { index: 0, name: "Widget", baseline: null, actual: null, diff: null },
-    ],
+    changed: [{ index: 0, name: "Widget", shots: changedShot(null, null) }],
   });
   assert.match(body, /<em>baseline for Widget unavailable<\/em>/);
   assert.doesNotMatch(body, /<img/);
@@ -182,9 +202,10 @@ test("the img src is attribute-escaped so a crafted path cannot break out", () =
       {
         index: 0,
         name: "X",
-        baseline: 'https://pages.example/pr-7/report/a"><script>b.png',
-        actual: null,
-        diff: null,
+        shots: changedShot(
+          'https://pages.example/pr-7/report/a"><script>b.png',
+          null
+        ),
       },
     ],
   });
@@ -202,9 +223,7 @@ test("a story name with HTML metacharacters is escaped in summary and alt", () =
       {
         index: 0,
         name: 'a <b> "c"',
-        baseline: "https://pages.example/pr-7/report/x.png",
-        actual: null,
-        diff: null,
+        shots: changedShot("https://pages.example/pr-7/report/x.png", null),
       },
     ],
   });
@@ -222,7 +241,7 @@ test("new stories with a preview show a proposed baseline with name-bearing alt"
       {
         index: 1,
         name: "Nav bar",
-        actual: "https://pages.example/pr-7/report/nav.png",
+        shots: newShot("https://pages.example/pr-7/report/nav.png"),
       },
     ],
   });
@@ -236,7 +255,7 @@ test("new stories without a preview still render a per-item approve checkbox", (
     ...base(),
     outcome: "changed",
     counts: { ...base().counts, new: "1", total: "1" },
-    added: [{ index: 0, name: "Nav bar", actual: null, actionKeys: ["nav"] }],
+    added: [{ index: 0, name: "Nav bar", shots: newShot(null), actionKeys: ["nav"] }],
   });
   assert.match(
     body,
@@ -250,7 +269,10 @@ test("deleted stories are listed with newlines flattened", () => {
     ...base(),
     outcome: "changed",
     counts: { ...base().counts, deleted: "2", total: "2" },
-    deletedNames: ["Old header", "multi\nline name"],
+    deleted: [
+      { name: "Old header", breakpoints: [] },
+      { name: "multi\nline name", breakpoints: [] },
+    ],
   });
   assert.match(body, /### Deleted \(2\)/);
   assert.match(body, /- Old header/);
@@ -262,9 +284,38 @@ test("a deleted story name with HTML metacharacters is escaped", () => {
     ...base(),
     outcome: "changed",
     counts: { ...base().counts, deleted: "1", total: "1" },
-    deletedNames: ['a <b> "c"'],
+    deleted: [{ name: 'a <b> "c"', breakpoints: [] }],
   });
   assert.match(body, /- a &lt;b&gt; "c"/);
+});
+
+test("the deleted section links the report's deleted heading when a preview is present", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "changed",
+    counts: { ...base().counts, deleted: "1", total: "1" },
+    previewUrl: "https://pages.example/pr-7",
+    deleted: [{ name: "Old header", breakpoints: [] }],
+  });
+  assert.match(body, /### Deleted \(1\)/);
+  assert.match(body, /- Old header/);
+  // One section-level anchor to the report's stable <h2 id="deleted-heading">,
+  // not a per-name link.
+  assert.match(
+    body,
+    /\[View deleted baselines in report →\]\(https:\/\/pages\.example\/pr-7\/report\/index\.html#deleted-heading\)/
+  );
+});
+
+test("the deleted section omits the report link when no preview is present", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "changed",
+    counts: { ...base().counts, deleted: "1", total: "1" },
+    deleted: [{ name: "Old header", breakpoints: [] }],
+  });
+  assert.match(body, /### Deleted \(1\)/);
+  assert.doesNotMatch(body, /View deleted baselines in report/);
 });
 
 test("pending work renders the approve CTA and the approve-box marker", () => {
@@ -273,14 +324,50 @@ test("pending work renders the approve CTA and the approve-box marker", () => {
     outcome: "changed",
     counts: { ...base().counts, changed: "1", total: "1" },
     previewUrl: "https://pages.example/pr-7",
-    changed: [
-      { index: 0, name: "Home", baseline: null, actual: null, diff: null },
-    ],
+    changed: [{ index: 0, name: "Home", shots: changedShot(null, null) }],
   });
   assert.match(body, /### Approve these changes/);
   assert.match(body, /<!-- tuffgal-approve-box -->/);
   assert.match(body, /📊 \[Open the full report\]/);
   assert.match(body, /@tuffgal approve/);
+});
+
+test("a deletion-only run (no changed/new) still renders the approve CTA", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "changed",
+    counts: { ...base().counts, deleted: "1", total: "1" },
+    deleted: [{ name: "old-footer", breakpoints: [] }],
+  });
+  // `pending` gates the CTA on new + changed + deleted > 0. A regression that
+  // dropped `deleted` from that formula would silently hide approval for a
+  // deletion-only run — so pin that deleted alone still renders both the CTA
+  // heading and the approve-box marker.
+  assert.match(body, /### Approve these changes/);
+  assert.match(body, /<!-- tuffgal-approve-box -->/);
+});
+
+test("a short-circuited run renders a compact body with NEITHER approve marker", () => {
+  const body = buildCommentBody({
+    shortCircuit: { sha: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0" },
+    runUrl: "https://github.com/o/r/actions/runs/9",
+  });
+  // Marker (so the sticky upsert still finds it), header, pass outcome, the
+  // reviewed short SHA, and a run link.
+  assert.ok(body.startsWith(MARKER + "\n"));
+  assert.match(body, /## 👁️ Tuffgal visual regression/);
+  assert.match(body, /Outcome: \*\*pass\*\*/);
+  assert.match(body, /`a1b2c3d`/);
+  assert.match(
+    body,
+    /\[View the run →\]\(https:\/\/github\.com\/o\/r\/actions\/runs\/9\)/
+  );
+  // Critically: NO approve-checkbox markers of any kind — nothing is pending.
+  assert.doesNotMatch(body, /tuffgal-approve-box/);
+  assert.doesNotMatch(body, /tuffgal-approve-item:/);
+  // And none of the full-layout scaffolding leaked in.
+  assert.doesNotMatch(body, /\| Status \| Count \|/);
+  assert.doesNotMatch(body, /### Approve these changes/);
 });
 
 test("a no-results outcome names the concrete config fix", () => {
@@ -336,12 +423,140 @@ test("a failed outcome that also has pending work keeps the approve CTA", () => 
       failed: "1",
       total: "3",
     },
-    changed: [
-      { index: 0, name: "Home", baseline: null, actual: null, diff: null },
-    ],
+    changed: [{ index: 0, name: "Home", shots: changedShot(null, null) }],
   });
   assert.match(body, /Download the `tuffgal-report` artifact/);
   assert.match(body, /### Approve these changes/);
+});
+
+// The Failed section — hard failures, rendered after Deleted (mirroring the
+// totals-table row order) as plain bullets with no approve checkbox.
+
+test("a failed story renders in the Failed section with its message and no checkbox", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "failed",
+    counts: { ...base().counts, passed: "2", failed: "1", total: "3" },
+    failed: [
+      { index: 0, name: "Checkout", message: "Timeout waiting for selector" },
+    ],
+  });
+  assert.match(body, /### Failed \(1\)/);
+  assert.match(body, /- \*\*Checkout\*\* — Timeout waiting for selector/);
+  // A hard failure is not an approvable change: no per-item checkbox/marker.
+  assert.doesNotMatch(body, /tuffgal-approve-item/);
+  assert.doesNotMatch(body, /Approve \*\*Checkout\*\*/);
+  // No preview URL, so no report deep-link on the entry.
+  assert.doesNotMatch(body, /Open Checkout in report/);
+});
+
+test("a failed story deep-links to the report when a preview is present", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "failed",
+    counts: { ...base().counts, passed: "2", failed: "1", total: "3" },
+    previewUrl: "https://pages.example/pr-7",
+    failed: [{ index: 3, name: "Checkout", message: "boom" }],
+  });
+  assert.match(
+    body,
+    /- \*\*Checkout\*\* — boom \[Open Checkout in report →\]\(https:\/\/pages\.example\/pr-7\/report\/index\.html#story-3\)/
+  );
+});
+
+test("a failed entry with an empty message renders just the name (no dangling dash)", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "failed",
+    counts: { ...base().counts, passed: "2", failed: "1", total: "3" },
+    failed: [{ index: 0, name: "Checkout", message: "" }],
+  });
+  assert.match(body, /### Failed \(1\)/);
+  const failedLine = body
+    .split("\n")
+    .find((l) => l.includes("**Checkout**"));
+  assert.strictEqual(failedLine, "- **Checkout**");
+});
+
+test("a failed message is HTML-escaped", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "failed",
+    counts: { ...base().counts, passed: "2", failed: "1", total: "3" },
+    failed: [{ index: 0, name: "S", message: 'a <b> "c" & d' }],
+  });
+  // escapeHtml handles & < > (not quotes, matching the rest of the module).
+  assert.match(body, /- \*\*S\*\* — a &lt;b&gt; "c" &amp; d/);
+});
+
+test("a failed message collapses its newlines and whitespace runs to single spaces", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "failed",
+    counts: { ...base().counts, passed: "2", failed: "1", total: "3" },
+    failed: [{ index: 0, name: "S", message: "a\nb\r\n  c\td" }],
+  });
+  assert.match(body, /- \*\*S\*\* — a b c d/);
+});
+
+test("a long failed message is truncated to ~140 chars with an ellipsis marker", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "failed",
+    counts: { ...base().counts, passed: "2", failed: "1", total: "3" },
+    failed: [{ index: 0, name: "S", message: "A".repeat(200) }],
+  });
+  // Exactly 140 A's, then the ellipsis; never the full 200-char run.
+  assert.match(body, /A{140}…/);
+  assert.doesNotMatch(body, /A{141}/);
+});
+
+test("a failed-only run (no new/changed/deleted) does NOT render the approve CTA", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "failed",
+    counts: {
+      passed: "2",
+      changed: "0",
+      new: "0",
+      deleted: "0",
+      failed: "1",
+      total: "3",
+    },
+    failed: [{ index: 0, name: "Checkout", message: "boom" }],
+  });
+  assert.match(body, /### Failed \(1\)/);
+  // The `pending` gate counts only new/changed/deleted, so a failed-only run
+  // must never offer approval — neither the CTA heading nor the box marker.
+  assert.doesNotMatch(body, /### Approve these changes/);
+  assert.doesNotMatch(body, /tuffgal-approve-box/);
+});
+
+test("a failed story alongside changed work keeps the approve CTA for the changed work only", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "failed",
+    counts: {
+      passed: "0",
+      changed: "1",
+      new: "0",
+      deleted: "0",
+      failed: "1",
+      total: "2",
+    },
+    changed: [
+      { index: 0, name: "Home", shots: changedShot(null, null), actionKeys: ["home"] },
+    ],
+    failed: [{ index: 1, name: "Checkout", message: "boom" }],
+  });
+  // Both sections render...
+  assert.match(body, /### Changed \(1\)/);
+  assert.match(body, /### Failed \(1\)/);
+  // ...the approve CTA still fires for the changed/new/deleted work...
+  assert.match(body, /### Approve these changes/);
+  // ...the changed story gets its checkbox, the failed story does not.
+  assert.match(body, /tuffgal-approve-item:home/);
+  assert.doesNotMatch(body, /Approve \*\*Checkout\*\*/);
 });
 
 test("empty story lists render only the outcome, table, and fallback link", () => {
@@ -349,6 +564,7 @@ test("empty story lists render only the outcome, table, and fallback link", () =
   assert.doesNotMatch(body, /### Changed/);
   assert.doesNotMatch(body, /### New/);
   assert.doesNotMatch(body, /### Deleted/);
+  assert.doesNotMatch(body, /### Failed/);
 });
 
 // The exported renderers are extracted for reuse and kept in step with the bash
@@ -433,9 +649,7 @@ test("a single changed entry renders one per-item approve checkbox with its key"
       {
         index: 0,
         name: "Home page",
-        baseline: null,
-        actual: null,
-        diff: null,
+        shots: changedShot(null, null),
         actionKeys: ["visit-home"],
       },
     ],
@@ -458,7 +672,7 @@ test("a single new entry renders one per-item approve checkbox with its key", ()
     counts: { ...base().counts, new: "1", total: "1" },
     previewUrl: "https://pages.example/pr-7",
     added: [
-      { index: 0, name: "Nav bar", actual: null, actionKeys: ["render-nav"] },
+      { index: 0, name: "Nav bar", shots: newShot(null), actionKeys: ["render-nav"] },
     ],
   });
   assert.match(
@@ -473,25 +687,11 @@ test("multiple entries each render their own per-item approve checkbox", () => {
     outcome: "changed",
     counts: { ...base().counts, changed: "2", new: "1", total: "3" },
     changed: [
-      {
-        index: 0,
-        name: "Home",
-        baseline: null,
-        actual: null,
-        diff: null,
-        actionKeys: ["home"],
-      },
-      {
-        index: 1,
-        name: "About",
-        baseline: null,
-        actual: null,
-        diff: null,
-        actionKeys: ["about"],
-      },
+      { index: 0, name: "Home", shots: changedShot(null, null), actionKeys: ["home"] },
+      { index: 1, name: "About", shots: changedShot(null, null), actionKeys: ["about"] },
     ],
     added: [
-      { index: 2, name: "Contact", actual: null, actionKeys: ["contact"] },
+      { index: 2, name: "Contact", shots: newShot(null), actionKeys: ["contact"] },
     ],
   });
   assert.match(body, /<!-- tuffgal-approve-item:home -->/);
@@ -508,25 +708,11 @@ test("with a preview, each per-item checkbox after the first is separated from t
     outcome: "changed",
     counts: { ...base().counts, changed: "2", new: "1", total: "3" },
     changed: [
-      {
-        index: 0,
-        name: "Home",
-        baseline: null,
-        actual: null,
-        diff: null,
-        actionKeys: ["home"],
-      },
-      {
-        index: 1,
-        name: "About",
-        baseline: null,
-        actual: null,
-        diff: null,
-        actionKeys: ["about"],
-      },
+      { index: 0, name: "Home", shots: changedShot(null, null), actionKeys: ["home"] },
+      { index: 1, name: "About", shots: changedShot(null, null), actionKeys: ["about"] },
     ],
     added: [
-      { index: 2, name: "Contact", actual: null, actionKeys: ["contact"] },
+      { index: 2, name: "Contact", shots: newShot(null), actionKeys: ["contact"] },
     ],
   });
   const lines = body.split("\n");
@@ -548,9 +734,7 @@ test("a story with 2+ actions comma-joins its keys in one marker", () => {
       {
         index: 0,
         name: "Dashboard",
-        baseline: null,
-        actual: null,
-        diff: null,
+        shots: changedShot(null, null),
         actionKeys: ["load-dashboard", "open-panel", "hover-tile"],
       },
     ],
@@ -568,14 +752,7 @@ test("per-item checkboxes leave the master approve-box markup byte-for-byte unch
     counts: { ...base().counts, changed: "1", total: "1" },
     previewUrl: "https://pages.example/pr-7",
     changed: [
-      {
-        index: 0,
-        name: "Home",
-        baseline: null,
-        actual: null,
-        diff: null,
-        actionKeys: ["home"],
-      },
+      { index: 0, name: "Home", shots: changedShot(null, null), actionKeys: ["home"] },
     ],
   });
   // The master checkbox — its literal marker, label, and helper text — is the
@@ -599,9 +776,7 @@ test("a story name with HTML metacharacters is escaped in its per-item checkbox"
       {
         index: 0,
         name: 'a <b> "c"',
-        baseline: null,
-        actual: null,
-        diff: null,
+        shots: changedShot(null, null),
         actionKeys: ["x"],
       },
     ],
@@ -610,4 +785,290 @@ test("a story name with HTML metacharacters is escaped in its per-item checkbox"
     body,
     /- \[ \] <!-- tuffgal-approve-item:x --> Approve \*\*a &lt;b&gt; "c"\*\*/
   );
+});
+
+// ---------------------------------------------------------------------------
+// Single-breakpoint parity — the common case. A single-config run (one shot per
+// entry, no `breakpoint`, multiBreakpoint false) must render byte-for-byte the
+// same body as the pre-breakpoint (single-shot) builder did. The golden fixture
+// was generated from the single-representative-shot builder against an
+// equivalent flat-shape fixture, so this locks the whole single-breakpoint
+// surface — banner, tables, deleted, failed, approve CTA — against any drift.
+// ---------------------------------------------------------------------------
+test("a single-breakpoint run renders byte-for-byte identical to the pre-breakpoint output", () => {
+  const body = buildCommentBody({
+    outcome: "changed",
+    counts: {
+      passed: "2",
+      changed: "1",
+      new: "1",
+      deleted: "1",
+      failed: "1",
+      total: "6",
+    },
+    envMismatch: true,
+    mismatchKeys: ["os", "viewport"],
+    previewUrl: "https://pages.example/pr-7",
+    changed: [
+      {
+        index: 0,
+        name: "Home hero",
+        shots: changedShot(
+          "https://pages.example/pr-7/baselines/home/0.png",
+          "https://pages.example/pr-7/report/home/0.png"
+        ),
+        actionKeys: ["visit-home", "hover-cta"],
+      },
+    ],
+    added: [
+      {
+        index: 1,
+        name: "Nav bar",
+        shots: newShot("https://pages.example/pr-7/report/nav/0.png"),
+        actionKeys: ["render-nav"],
+      },
+    ],
+    deleted: [{ name: "old-footer", breakpoints: [] }],
+    failed: [
+      {
+        index: 2,
+        name: "Checkout flow",
+        message: 'Timeout 30000ms exceeded waiting for selector ".pay"',
+        breakpoint: undefined,
+      },
+    ],
+    multiBreakpoint: false,
+    runUrl: "https://github.com/o/r/actions/runs/1",
+  });
+  const golden = fs.readFileSync(
+    path.join(__dirname, "build-comment.single-breakpoint-parity.txt"),
+    "utf8"
+  );
+  assert.strictEqual(body, golden);
+});
+
+// ---------------------------------------------------------------------------
+// Multi-breakpoint mode — the new behavior. Detail tables gain a Breakpoint
+// column with one row per drifted breakpoint; the checkbox, deleted, and failed
+// lines carry breakpoint labels.
+// ---------------------------------------------------------------------------
+test("a multi-breakpoint changed story renders a Breakpoint | Baseline | Actual table with one row per breakpoint", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "changed",
+    counts: { ...base().counts, changed: "1", total: "1" },
+    previewUrl: "https://pages.example/pr-7",
+    multiBreakpoint: true,
+    changed: [
+      {
+        index: 0,
+        name: "Home hero",
+        shots: [
+          {
+            breakpoint: "mobile",
+            baseline: "https://pages.example/pr-7/baselines/home/mobile.png",
+            actual: "https://pages.example/pr-7/report/home/mobile.png",
+          },
+          {
+            breakpoint: "desktop",
+            baseline: "https://pages.example/pr-7/baselines/home/desktop.png",
+            actual: "https://pages.example/pr-7/report/home/desktop.png",
+          },
+        ],
+        actionKeys: ["visit-home"],
+      },
+    ],
+  });
+  // Three-column header, never the single-breakpoint two-column one.
+  assert.match(body, /^\| Breakpoint \| Baseline \| Actual \|$/m);
+  assert.doesNotMatch(body, /^\| Baseline \| Actual \|$/m);
+  // One labelled row per breakpoint, each carrying that breakpoint's images.
+  assert.match(
+    body,
+    /^\| mobile \| <img src="https:\/\/pages\.example\/pr-7\/baselines\/home\/mobile\.png"[^|]*\| <img src="https:\/\/pages\.example\/pr-7\/report\/home\/mobile\.png"[^|]*\|$/m
+  );
+  assert.match(
+    body,
+    /^\| desktop \| <img src="https:\/\/pages\.example\/pr-7\/baselines\/home\/desktop\.png"[^|]*\| <img src="https:\/\/pages\.example\/pr-7\/report\/home\/desktop\.png"[^|]*\|$/m
+  );
+  // The checkbox names which breakpoints drifted, after the marker + tick-box.
+  assert.match(
+    body,
+    /- \[ \] <!-- tuffgal-approve-item:visit-home --> Approve \*\*Home hero\*\* \(mobile, desktop\)/
+  );
+});
+
+test("a multi-breakpoint new story renders a Breakpoint | Actual table (actual-only), one row per breakpoint", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "changed",
+    counts: { ...base().counts, new: "1", total: "1" },
+    previewUrl: "https://pages.example/pr-7",
+    multiBreakpoint: true,
+    added: [
+      {
+        index: 0,
+        name: "Nav bar",
+        shots: [
+          { breakpoint: "mobile", actual: "https://pages.example/pr-7/report/nav/mobile.png" },
+          { breakpoint: "desktop", actual: "https://pages.example/pr-7/report/nav/desktop.png" },
+        ],
+        actionKeys: ["render-nav"],
+      },
+    ],
+  });
+  assert.match(body, /^\| Breakpoint \| Actual \|$/m);
+  // No Baseline column for a new story, and not the single-breakpoint prose line.
+  assert.doesNotMatch(body, /Baseline/);
+  assert.doesNotMatch(body, /Proposed new baseline:/);
+  assert.match(
+    body,
+    /^\| mobile \| <img src="https:\/\/pages\.example\/pr-7\/report\/nav\/mobile\.png"[^|]*\|$/m
+  );
+  assert.match(
+    body,
+    /^\| desktop \| <img src="https:\/\/pages\.example\/pr-7\/report\/nav\/desktop\.png"[^|]*\|$/m
+  );
+  assert.match(
+    body,
+    /Approve \*\*Nav bar\*\* \(mobile, desktop\)/
+  );
+});
+
+test("a multi-breakpoint deleted story lists all its breakpoints on one grouped line", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "changed",
+    counts: { ...base().counts, deleted: "2", total: "2" },
+    multiBreakpoint: true,
+    deleted: [{ name: "old-footer", breakpoints: ["mobile", "desktop"] }],
+  });
+  // One grouped bullet (not one per breakpoint), with the breakpoints joined.
+  assert.match(body, /^- old-footer — mobile, desktop$/m);
+  assert.strictEqual((body.match(/- old-footer/g) || []).length, 1);
+});
+
+test("a multi-breakpoint failed story carries a (breakpoint) label after its name", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "failed",
+    counts: { ...base().counts, passed: "1", failed: "1", total: "2" },
+    multiBreakpoint: true,
+    failed: [{ index: 0, name: "Checkout", message: "boom", breakpoint: "mobile" }],
+  });
+  assert.match(body, /- \*\*Checkout\*\* \(mobile\) — boom/);
+});
+
+test("breakpoint names are HTML-escaped everywhere they render", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "changed",
+    counts: { ...base().counts, changed: "1", deleted: "1", total: "2" },
+    previewUrl: "https://pages.example/pr-7",
+    multiBreakpoint: true,
+    changed: [
+      {
+        index: 0,
+        name: "Home",
+        shots: [
+          { breakpoint: "a<b", baseline: null, actual: null },
+        ],
+        actionKeys: ["home"],
+      },
+    ],
+    deleted: [{ name: "old", breakpoints: ["a<b"] }],
+  });
+  // Checkbox suffix, table row, and deleted line all escape the metacharacter.
+  assert.match(body, /Approve \*\*Home\*\* \(a&lt;b\)/);
+  assert.match(body, /^\| a&lt;b \|/m);
+  assert.match(body, /- old — a&lt;b/);
+  assert.doesNotMatch(body, /a<b/);
+});
+
+// ---------------------------------------------------------------------------
+// Legacy fallback — a results.json artifact predating the `breakpoint` field.
+// action.yml computes multiBreakpoint === false (no non-empty breakpoint names),
+// so the body must take the single-breakpoint path: two-column table, plain
+// deleted names, no breakpoint labels anywhere.
+// ---------------------------------------------------------------------------
+test("a legacy fixture with no breakpoint field renders via the single-breakpoint path", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "changed",
+    counts: { ...base().counts, changed: "1", deleted: "1", failed: "1", total: "3" },
+    previewUrl: "https://pages.example/pr-7",
+    multiBreakpoint: false,
+    changed: [
+      {
+        index: 0,
+        name: "Home",
+        shots: changedShot(
+          "https://pages.example/pr-7/baselines/home/0.png",
+          "https://pages.example/pr-7/report/home/0.png"
+        ),
+        actionKeys: ["home"],
+      },
+    ],
+    deleted: [{ name: "old-footer", breakpoints: [] }],
+    failed: [{ index: 1, name: "Checkout", message: "boom", breakpoint: undefined }],
+  });
+  // Single-breakpoint two-column table, no Breakpoint column anywhere.
+  assert.match(body, /^\| Baseline \| Actual \|$/m);
+  assert.doesNotMatch(body, /Breakpoint/);
+  // Plain deleted name, no breakpoint suffix.
+  assert.match(body, /^- old-footer$/m);
+  // Plain failed line, no (breakpoint) label.
+  assert.match(body, /- \*\*Checkout\*\* — boom/);
+  // Checkbox carries no breakpoint suffix.
+  assert.match(body, /Approve \*\*Home\*\*$/m);
+});
+
+// ---------------------------------------------------------------------------
+// Marker integrity — the breakpoint suffix is free text AFTER the per-item
+// marker + tick-box, so it must be invisible to resolve-approver.js's actual
+// CHECKED_ITEM_BOX regex. We render a real multi-breakpoint body, tick the box,
+// and feed the whole thing through the ACTUAL approver parser (not a re-derived
+// regex) to prove the ticked box still resolves to exactly its action keys.
+// ---------------------------------------------------------------------------
+test("the multi-breakpoint checkbox suffix stays invisible to resolve-approver's marker regex", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "changed",
+    counts: { ...base().counts, changed: "1", total: "1" },
+    previewUrl: "https://pages.example/pr-7",
+    multiBreakpoint: true,
+    changed: [
+      {
+        index: 0,
+        name: "Home hero",
+        shots: [
+          { breakpoint: "mobile", baseline: null, actual: null },
+          { breakpoint: "desktop", baseline: null, actual: null },
+        ],
+        actionKeys: ["visit-home", "hover-cta"],
+      },
+    ],
+  });
+  // The rendered checkbox actually carries the suffix we are testing against.
+  const checkboxLine = body
+    .split("\n")
+    .find((l) => l.includes("tuffgal-approve-item:visit-home,hover-cta"));
+  assert.match(checkboxLine, /Approve \*\*Home hero\*\* \(mobile, desktop\)$/);
+
+  // Tick it and feed the whole body through the real approve-trigger parser.
+  const tickedBody = body.replace(
+    "- [ ] <!-- tuffgal-approve-item:visit-home,hover-cta -->",
+    "- [x] <!-- tuffgal-approve-item:visit-home,hover-cta -->"
+  );
+  const verdict = resolveApprover({
+    eventName: "issue_comment",
+    action: "edited",
+    comment: { body: tickedBody, user: { login: "maintainer" } },
+    issue: { pull_request: {} },
+    contextActor: "maintainer",
+  });
+  assert.strictEqual(verdict.proceed, true);
+  assert.strictEqual(verdict.via, "checkbox");
+  // The suffix did not perturb key extraction: exactly the two embedded keys.
+  assert.deepStrictEqual(verdict.selection.sort(), ["hover-cta", "visit-home"]);
 });

@@ -75,9 +75,9 @@ For a static-site project that doesn't need a database, you can drop the
 
 When `pages-preview` is on, a run with pending changes publishes the report
 and baselines to a per-PR GitHub Pages preview. The sticky comment then
-carries, for each changed story, inline baseline / actual / diff thumbnails
-and an open-in-report link that jumps straight to that story with its
-screenshots expanded.
+carries, for each changed story, inline side-by-side baseline / actual
+thumbnails and an open-in-report link that jumps straight to that story with
+its screenshots — including the full diff — expanded.
 
 It needs two things on the consumer repo:
 
@@ -125,23 +125,35 @@ contract the CI-owned-baselines model asks of a consumer.
 
 ## Outputs
 
-| Name           | Description                                                                                                                                                                    |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `changed`      | Number of stories whose committed baseline changed (pixels or a11y snapshot)                                                                                                   |
-| `deleted`      | Number of orphaned baseline entries with no matching story/action (pruned on approve)                                                                                          |
-| `env-mismatch` | `'true'` when the capture environment in `baselines/manifest.json` no longer matches this CI run (expect a full re-approve)                                                    |
-| `failed`       | Number of stories that failed                                                                                                                                                  |
-| `new`          | Number of stories with no committed baseline yet (candidate written)                                                                                                           |
-| `outcome`      | One of `pass`, `changed` (pending new/changed/deleted review), `env-mismatch`, `failed`, or `no-results`                                                                       |
-| `passed`       | Number of stories that passed                                                                                                                                                  |
-| `preview-url`  | Base URL of the per-PR Pages preview (e.g. `https://owner.github.io/repo/pr-41`), or empty when the preview was off/skipped/failed. Append `/report/index.html` for the report |
-| `total`        | Total stories executed                                                                                                                                                         |
+| Name              | Description                                                                                                                                                                         |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `changed`         | Number of stories whose committed baseline changed (pixels or a11y snapshot)                                                                                                        |
+| `deleted`         | Number of orphaned baseline entries with no matching story/action (pruned on approve)                                                                                               |
+| `env-mismatch`    | `'true'` when the capture environment in `baselines/manifest.json` no longer matches this CI run (expect a full re-approve)                                                         |
+| `failed`          | Number of stories that failed                                                                                                                                                       |
+| `new`             | Number of stories with no committed baseline yet (candidate written)                                                                                                                |
+| `outcome`         | One of `pass`, `changed` (pending new/changed/deleted review), `env-mismatch`, `failed`, or `no-results`                                                                            |
+| `passed`          | Number of stories that passed                                                                                                                                                       |
+| `preview-url`     | Base URL of the per-PR Pages preview (e.g. `https://owner.github.io/repo/pr-41`), or empty when the preview was off/skipped/failed. Append `/report/index.html` for the report      |
+| `short-circuited` | `'true'` when the visual suite was skipped because the triggering commit only promotes already-approved baselines (a same-repo full-approval commit); `'false'` on every normal run |
+| `total`           | Total stories executed                                                                                                                                                              |
 
 `outcome` follows Tuffgal's exit-code precedence: `failed` (broken stories) >
 `env-mismatch` (capture environment changed) > `changed` (pending visual
 review) > `pass`.
 
 ## What it does, step by step
+
+On a PR event, a fast pre-check runs first: it inspects the head commit, and if
+that commit is a same-repo **full-approval** commit that only promotes
+already-approved baselines (a `Tuffgal-Full-Approval` trailer, a single matching
+parent, and a diff confined to `baselines-path`), the action skips the setup and
+Tuffgal-run steps below (setup-node through `tuffgal run`); the parse step then
+reports `outcome=pass` with `short-circuited: true` — the promoted tree is
+byte-identical to the run that was already approved, so re-running it would
+reproduce the same result. Anything ambiguous (a fork PR, a merge commit, a
+commit that also touches source, an API error) falls through to the normal run
+below. Otherwise:
 
 1. `actions/setup-node@v4` with the requested Node version and npm cache
 2. `npm ci` in `working-directory`
@@ -152,7 +164,7 @@ review) > `pass`.
 7. Copy `results.json` into `<report-path>/candidates/` so the candidates artifact is self-contained for `tuffgal approve --from`
 8. Upload `<report-path>/` as `tuffgal-report` (on failures, no-results, or pending changes) and `<report-path>/candidates/` as `tuffgal-candidates` (when visual changes await review)
 9. On a PR with pending changes (and `pages-preview: true`), publish `<report-path>/` + `<baselines-path>/` to the `gh-pages` branch under `pr-<n>/`, so the report and every PNG have a real URL (best-effort — a failure just leaves the comment on the artifact-download path)
-10. On a PR event, upsert a sticky comment (marker `<!-- tuffgal-report -->`) with the totals and, when a preview published, per-changed-story inline baseline/actual/diff thumbnails + an **Open in report →** deep-link; otherwise the plain story names + artifact-download instructions. Includes an environment-mismatch banner when set, an approve checkbox + `@tuffgal approve` command, and a link to the run
+10. On a PR event, upsert a sticky comment (marker `<!-- tuffgal-report -->`) with the totals and, when a preview published, per-changed-story inline side-by-side baseline/actual thumbnails + an **Open in report →** deep-link, a **Failed** section listing each broken story (with its failure message and a report deep-link), and a report link on the **Deleted** section; otherwise the plain story names + artifact-download instructions. When a run spans more than one breakpoint, the Changed/New thumbnails become a per-breakpoint table (one row per drifted breakpoint) and the Deleted, Failed, and per-story approve-checkbox lines name which breakpoints drifted; a single-breakpoint run renders exactly as before. Includes an environment-mismatch banner when set, an approve checkbox + `@tuffgal approve` command, and a link to the run
 11. Re-surface a non-zero exit when `outcome` is `failed`, `no-results`, `env-mismatch`, or `changed` (when `fail-on-changed: true`)
 
 ## Approving candidate baselines
@@ -184,6 +196,42 @@ Alternatively a maintainer comments `@tuffgal approve` on the PR. The bot
 verifies the commenter has write access, downloads the candidates artifact from
 the PR's latest run, applies it with `tuffgal approve --from <dir> --prune`, and
 commits the updated baselines to the PR head branch.
+
+### Live status in the sticky comment
+
+Approving takes a couple of minutes (fetching candidates, then committing them).
+Rather than leave the report comment looking frozen behind a lone 👀 reaction,
+the bot edits that same comment in place as the run progresses:
+
+- **⚙️ In-flight** — the moment the approver is verified: _Approving baselines —
+  fetching the approved candidates and committing them…_
+- **📦 Milestone** — once the candidates are fetched and filtered: _committing
+  the approved baselines…_
+- **✅ Final** — after the commit lands. A full approval reports _All baselines
+  approved and committed as `<sha>`_ and removes the now-pointless approve
+  checkbox; a partial approval reports _Promoted N of M candidate baselines_,
+  rewrites each just-approved story to a non-interactive **✅ Approved** line (its
+  checkbox and hidden marker removed, so it can't be re-ticked or re-trigger the
+  workflow), and relabels the top-level box to **Approve remaining baselines** so
+  only the still-pending stories stay tickable — or, when that partial happened to
+  cover every remaining story, removes the approve section entirely, just like a
+  full approval. The banner's closing line depends on the
+  token: with the default `GITHUB_TOKEN` it explains the visual check won't
+  re-run on its own and how to kick it; with a custom PAT / App token it notes
+  the check re-runs against the new baselines (and, on a full approval,
+  short-circuits to a fast pass).
+- **⚠️ Failure** — if approval doesn't complete, the banner says so and invites a
+  retry. The approve boxes are already re-tickable (they're unticked the instant
+  approval starts).
+
+This live banner is **in addition to** the bot's existing approve feedback, not a
+replacement: the separate `<!-- tuffgal-approve -->` reply comment and the 👀 / 🚀
+reactions on your triggering comment still fire exactly as before. The banner just
+keeps the main report comment current while all of that happens.
+
+These edits are made with the default `GITHUB_TOKEN` and always leave every
+approve checkbox **unticked**, so the bot can never edit its own comment into a
+shape that re-triggers the approve workflow.
 
 Both paths use the same workflow. Copy this into
 `.github/workflows/tuffgal-approve.yml`:
@@ -290,7 +338,27 @@ The shortcut is orthogonal to the token choice above. It works with the default
 `GITHUB_TOKEN` or a PAT / App token, because it writes the check result directly
 via GitHub's Checks API rather than relying on the commit to trigger a workflow.
 Mix and match: the shortcut alone (skip the re-run on full clears), a PAT alone
-(let real re-runs clear themselves), both, or neither.
+(a full clear short-circuits fast; only a partial approve triggers a real re-run
+that clears itself — see "The PAT path skips too" below), both, or neither.
+
+**The PAT path skips too.** The synthesized check above (from v1.5.0) only ever
+helped the default-`GITHUB_TOKEN` path — where the approval push fires no workflow
+at all, so there is nothing to skip. With a PAT / App token the push _does_
+retrigger your visual workflow, and until now that rerun re-ran the whole suite
+against a tree it had just approved. The main action now closes that gap: it
+recognizes its own trigger commit as a full-approval commit and skips the suite
+before it starts, reporting `outcome=pass` and `short-circuited: true` in a few
+seconds instead of re-running Playwright. It gates the skip on a **same-repo**
+push whose commit carries the `Tuffgal-Full-Approval` trailer, has exactly one
+parent equal to that trailer's SHA, and changes only files under your baselines
+directory — a fork PR, a merge commit, or any commit that also touches source
+falls through to a normal run. (This is a build-speed optimization, not a security
+boundary: a same-repo push already requires write access, and anyone with write
+access could approve the baselines for real; the fork exclusion is what keeps an
+untrusted fork author from forging the trailer.) Under a PAT **and** a configured
+`check-name`, both mechanisms fire on the same approval — the synthesized check
+plus a real-but-instant short-circuited run under the same check name — and both
+land green, which is expected.
 
 **Security model.** The approve job is deliberately conservative:
 

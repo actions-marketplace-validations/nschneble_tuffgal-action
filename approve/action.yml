@@ -165,6 +165,72 @@ runs:
           core.setOutput('selection', JSON.stringify(selection));
 
     # ------------------------------------------------------------------ #
+    # 1b. In-flight sticky-comment status. The MOMENT the gate proceeds,  #
+    #     rewrite the SAME `<!-- tuffgal-report -->` sticky comment to an  #
+    #     "approving now" banner so the maintainer sees progress instead   #
+    #     of a frozen comment during the (multi-minute) fetch + commit.    #
+    #                                                                     #
+    #     LOOP SAFETY: this uses the DEFAULT `github.token`, NOT           #
+    #     `inputs.token`. GitHub does not fire workflow events for comment #
+    #     edits made with GITHUB_TOKEN (recursion prevention), so this     #
+    #     edit can never retrigger the consumer's approve workflow — a      #
+    #     second, independent barrier on top of the untick transform,      #
+    #     which already rewrites every ticked approve box to `[ ]` before  #
+    #     the write and asserts `!hasTickedApproveMarker` on the outgoing  #
+    #     body. Emits `comment_id` (empty when no sticky comment exists);  #
+    #     every later report step no-ops on the empty case. Wrapped in     #
+    #     try/catch — a cosmetic status failure must never block approval. #
+    # ------------------------------------------------------------------ #
+    - name: Post in-flight status on the sticky report comment
+      id: report_status
+      if: steps.gate.outputs.proceed == 'true'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        PR_NUMBER: ${{ steps.gate.outputs.pr_number }}
+        # This composite's own action dir (see the commit step's ACTION_PATH note).
+        # The script requires report-comment.js from here.
+        ACTION_PATH: ${{ github.action_path }}
+      with:
+        # DEFAULT token — see the loop-safety note above. Never inputs.token here.
+        github-token: ${{ github.token }}
+        script: |
+          const { REPORT_MARKER, untickApproveBoxes, withStatusBanner, hasTickedApproveMarker } =
+            require(`${process.env.ACTION_PATH}/scripts/report-comment.js`);
+          const { owner, repo } = context.repo;
+          const prNumber = Number(process.env.PR_NUMBER);
+          const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+          // Default to "no sticky comment to edit" so every later report step
+          // no-ops safely if the search fails or finds nothing.
+          core.setOutput('comment_id', '');
+          try {
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: prNumber, per_page: 100,
+            });
+            const sticky = comments.find((c) => c.body && c.body.includes(REPORT_MARKER));
+            if (!sticky) {
+              core.info('No tuffgal-report sticky comment found; skipping status edits.');
+              return;
+            }
+            const banner = [
+              `> ⚙️ **Approving baselines** — fetching the approved candidates and committing them to this branch. This can take a few minutes.`,
+              `>`,
+              `> [View the run →](${runUrl})`,
+            ];
+            const newBody = withStatusBanner(untickApproveBoxes(sticky.body), banner);
+            // Loop-safety assertion: never write a body that still carries a
+            // ticked approve marker (would risk retriggering the approve workflow).
+            if (hasTickedApproveMarker(newBody)) {
+              core.warning('Refusing to write in-flight status: outgoing body still carries a ticked approve marker.');
+              return;
+            }
+            await github.rest.issues.updateComment({ owner, repo, comment_id: sticky.id, body: newBody });
+            core.setOutput('comment_id', String(sticky.id));
+          } catch (error) {
+            core.warning(`Could not post in-flight status to the sticky comment: ${error.message}`);
+          }
+
+    # ------------------------------------------------------------------ #
     # 2. Check out the BASE repository's DEFAULT branch — trusted code    #
     #    only. The PR head branch is never checked out or executed; it is #
     #    used solely as a commit target (via the git data API) and as a   #
@@ -430,6 +496,51 @@ runs:
           core.info(`Partial approve: kept ${keep.length} of ${presentDirNames.length} candidate baseline(s); removed ${remove.length}.`);
 
     # ------------------------------------------------------------------ #
+    # 4c. Milestone sticky-comment status. The candidates were fetched +  #
+    #     filtered, so advance the banner to "committing…". Re-FETCHES the #
+    #     comment fresh by id (never reuses step 1b's stale body — another #
+    #     process could have touched it since). No-ops when step 1b found  #
+    #     no sticky comment. Same DEFAULT-token + untick + assert +        #
+    #     try/catch-and-continue discipline as every report step.          #
+    # ------------------------------------------------------------------ #
+    - name: Update sticky report comment with the fetched-candidates milestone
+      id: report_milestone
+      if: steps.gate.outputs.proceed == 'true' && steps.download.outputs.found == 'true' && steps.report_status.outputs.comment_id != ''
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        COMMENT_ID: ${{ steps.report_status.outputs.comment_id }}
+        # This composite's own action dir (see the commit step's ACTION_PATH note).
+        # The script requires report-comment.js from here.
+        ACTION_PATH: ${{ github.action_path }}
+      with:
+        # DEFAULT token — GITHUB_TOKEN comment edits never fire workflow events.
+        github-token: ${{ github.token }}
+        script: |
+          const { untickApproveBoxes, withStatusBanner, hasTickedApproveMarker } =
+            require(`${process.env.ACTION_PATH}/scripts/report-comment.js`);
+          const { owner, repo } = context.repo;
+          const commentId = Number(process.env.COMMENT_ID);
+          const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+          try {
+            // Re-fetch fresh — never reuse the in-flight body from step 1b.
+            const current = await github.rest.issues.getComment({ owner, repo, comment_id: commentId });
+            const banner = [
+              `> 📦 **Candidates fetched** — committing the approved baselines…`,
+              `>`,
+              `> [View the run →](${runUrl})`,
+            ];
+            const newBody = withStatusBanner(untickApproveBoxes(current.data.body || ''), banner);
+            if (hasTickedApproveMarker(newBody)) {
+              core.warning('Refusing to write milestone status: outgoing body still carries a ticked approve marker.');
+              return;
+            }
+            await github.rest.issues.updateComment({ owner, repo, comment_id: commentId, body: newBody });
+          } catch (error) {
+            core.warning(`Could not post milestone status to the sticky comment: ${error.message}`);
+          }
+
+    # ------------------------------------------------------------------ #
     # 5. Preflight the trusted default-branch CLI for `approve --from`    #
     #    support BEFORE we invoke it. A tuffgal older than                #
     #    `0.2.0-alpha.1` has no `--from`, silently falls through to a     #
@@ -567,6 +678,7 @@ runs:
     #    other error → warning) and never fails the job.                  #
     # ------------------------------------------------------------------ #
     - name: Commit baselines to PR head branch
+      id: commit
       if: steps.gate.outputs.proceed == 'true' && steps.download.outputs.found == 'true'
       uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       env:
@@ -709,8 +821,44 @@ runs:
 
           if (tree.length === 0) {
             core.info('No baseline changes to commit.');
+            // Signal the benign no-op to the final status step so it can restore
+            // the sticky comment to a stable state instead of leaving the
+            // "committing…" banner stuck, and so the failure step does not fire.
+            core.setOutput('nothing_to_commit', 'true');
             return;
           }
+
+          // Compute the full-clear decision UP FRONT so the SAME boolean gates
+          // both the commit-message trailer (below) and the check-synthesis block
+          // further down. These read only already-available env counts, never the
+          // commit result. Deletions always resolve on any approve trigger
+          // (`--prune` is unconditional), so the run's deleted count is folded into
+          // BOTH keptCount and pendingTotal: it cancels out in the strict-equality
+          // gate (can never flip a partial into a full clear) and rescues the
+          // deletion-only full clear where the candidate-dir count is 0.
+          // Number('') === 0, so a missing DELETED_COUNT degrades fail-safe; env
+          // counts are strings and the module fail-closes NaN / non-integer input.
+          const checkNames = parseCheckNames(process.env.CHECK_NAME);
+          const deletedCount = Number(process.env.DELETED_COUNT);
+          const { pendingTotal, keptCount } = foldDeletions({
+            candidateCount: Number(process.env.CANDIDATE_COUNT),
+            promotedCount: Number(process.env.PROMOTED_COUNT),
+            deletedCount,
+          });
+          const fullClear = shouldSynthesizeCheck({ pendingTotal, keptCount });
+
+          // On a FULL clear, append the Tuffgal-Full-Approval trailer naming the
+          // parent (head) SHA the candidates were captured against — the SAME SHA
+          // passed as `parents` below. The MAIN action's scripts/run-skip.js reader
+          // greps for this exact literal (HAND-DUPLICATED cross-package contract;
+          // ci.yml approve-trailer-source-lock pins the two copies byte-equal) and,
+          // on the consumer's next same-repo push, skips re-running the
+          // byte-identical suite — closing the PAT-token rerun gap the
+          // GITHUB_TOKEN-only #31 check-synthesis shortcut never covered. A partial
+          // approve keeps today's exact single-line message, byte-for-byte.
+          const message = fullClear
+            ? `chore(tuffgal): approve candidate baselines\n\nTuffgal-Full-Approval: ${headSha}`
+            : 'chore(tuffgal): approve candidate baselines';
 
           const headCommit = await github.rest.git.getCommit({ owner, repo, commit_sha: headSha });
           const newTree = await github.rest.git.createTree({
@@ -718,7 +866,7 @@ runs:
           });
           const commit = await github.rest.git.createCommit({
             owner, repo,
-            message: 'chore(tuffgal): approve candidate baselines',
+            message,
             tree: newTree.data.sha,
             parents: [headSha],
             author: { name: process.env.GIT_USER_NAME, email: process.env.GIT_USER_EMAIL },
@@ -736,39 +884,36 @@ runs:
             return;
           }
 
-          await github.rest.reactions.createForIssueComment({
-            owner, repo, comment_id: Number(process.env.COMMENT_ID), content: 'rocket',
-          });
-
           // Short SHA of the new commit, reused by the synthesized-check summary and
           // the success comment's commit link below.
           const shortSha = commit.data.sha.slice(0, 7);
 
-          // Re-run shortcut. We are here ONLY because a real commit landed and the
-          // ref fast-forwarded (tree.length === 0 returned early; an updateRef
-          // failure returned above), so commit.data.sha is a genuine new SHA. If a
-          // `check-name` is configured and this approval was a FULL clear, mark that
-          // required check passing directly on the new SHA — the committed tree is
-          // byte-identical to the run that captured the candidates, so the rerun is
-          // redundant. The pure module owns both decisions; a partial approve or an
-          // empty check-name yields no check. env counts are strings, so coerce with
-          // Number — the module fail-closes NaN / non-integer input.
-          //
-          // Deletions always resolve on ANY approve trigger (`--prune` is
-          // unconditional; they are never gated by the per-item selection), so the
-          // run's deleted count is folded into BOTH keptCount and pendingTotal: it
-          // cancels out in the strict-equality gate (can never flip a partial into a
-          // full clear) and rescues the deletion-only full clear where the filter
-          // step's candidate-dir count is 0. Number('') === 0, so a missing
-          // DELETED_COUNT degrades fail-safe (deletion-only simply gets no shortcut).
-          const checkNames = parseCheckNames(process.env.CHECK_NAME);
-          const deletedCount = Number(process.env.DELETED_COUNT);
-          const { pendingTotal, keptCount } = foldDeletions({
-            candidateCount: Number(process.env.CANDIDATE_COUNT),
-            promotedCount: Number(process.env.PROMOTED_COUNT),
-            deletedCount,
+          // Surface the successful commit to the final status step (a SEPARATE
+          // step, because it must edit the sticky comment with the DEFAULT token,
+          // not this step's inputs.token). Set the MOMENT the ref fast-forwarded —
+          // BEFORE the reaction and success-comment calls below — so a later
+          // cosmetic failure in this step (a deleted comment, a transient reaction
+          // API error) still lets the final step post the success banner rather than
+          // a misleading failure one: the branch genuinely advanced, so committed is
+          // already 'true' by the time anything cosmetic can throw.
+          core.setOutput('committed', 'true');
+          core.setOutput('commit_sha', commit.data.sha);
+          core.setOutput('short_sha', shortSha);
+
+          await github.rest.reactions.createForIssueComment({
+            owner, repo, comment_id: Number(process.env.COMMENT_ID), content: 'rocket',
           });
-          const fullClear = shouldSynthesizeCheck({ pendingTotal, keptCount });
+
+          // Re-run shortcut (check synthesis). We are here ONLY because a real
+          // commit landed and the ref fast-forwarded (tree.length === 0 returned
+          // early; an updateRef failure returned above), so commit.data.sha is a
+          // genuine new SHA. `checkNames` / `fullClear` were computed before the
+          // commit above (they read only env counts, and the trailer already used
+          // `fullClear`). If a `check-name` is configured and this approval was a
+          // FULL clear, mark that required check passing directly on the new SHA —
+          // the committed tree is byte-identical to the run that captured the
+          // candidates, so a rerun is redundant. A partial approve or an empty
+          // check-name yields no check.
           const synthesizedNames = [];
           if (checkNames.length > 0 && fullClear) {
             const summary = [
@@ -854,3 +999,200 @@ runs:
             owner, repo, issue_number: Number(process.env.PR_NUMBER),
             body: ['<!-- tuffgal-approve -->', committed, ...partialNote, ...tail, ...checkNote].join('\n'),
           });
+
+    # ------------------------------------------------------------------ #
+    # 8. Final sticky-comment status. Runs after the commit step reached  #
+    #    a benign terminal state — either a real commit landed             #
+    #    (`committed`) or there was nothing to commit                      #
+    #    (`nothing_to_commit`). `always()` so a post-commit cosmetic       #
+    #    failure in the commit step (a failed reaction / success comment    #
+    #    AFTER the ref fast-forwarded, with `committed` already set) does   #
+    #    not suppress the success banner. Separate step — not folded into   #
+    #    the commit step — because it edits the sticky comment with the     #
+    #    DEFAULT `github.token`, whereas the commit step uses inputs.token. #
+    #                                                                     #
+    #    Full approve: STRIP the whole "Approve these changes" CTA         #
+    #    (approve-all box included) — nothing left to approve. Partial:     #
+    #    leave the (already-unticked) boxes in place. Sets `reported=true` #
+    #    so the failure step below stands down. Same untick + assert +     #
+    #    try/catch discipline.                                             #
+    # ------------------------------------------------------------------ #
+    - name: Finalize the sticky report comment status
+      id: report_final
+      if: always() && steps.gate.outputs.proceed == 'true' && steps.report_status.outputs.comment_id != '' && (steps.commit.outputs.committed == 'true' || steps.commit.outputs.nothing_to_commit == 'true')
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        COMMENT_ID: ${{ steps.report_status.outputs.comment_id }}
+        NOTHING_TO_COMMIT: ${{ steps.commit.outputs.nothing_to_commit }}
+        COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+        SHORT_SHA: ${{ steps.commit.outputs.short_sha }}
+        # 'true' only for a partial per-item approve (a subset of stories); 'false'
+        # for a full approve (mention / approve-all box). Same signal the commit
+        # step's success comment uses.
+        IS_PARTIAL: ${{ steps.filter.outputs.partial }}
+        PROMOTED_COUNT: ${{ steps.filter.outputs.kept }}
+        CANDIDATE_COUNT: ${{ steps.filter.outputs.total }}
+        # The JSON-encoded approve selection ('all' for a full approve, or a
+        # string[] of the approved action keys for a partial per-item approve — the
+        # same value the filter step consumes). Only read on the partial path below,
+        # where it is always the key array, to relabel the just-approved item boxes.
+        SELECTION: ${{ steps.gate.outputs.selection }}
+        # 'true'/'false' from a GitHub-expression comparison; the token value never
+        # reaches the environment. Drives the retrigger tail (default token = the
+        # check won't re-run on its own; custom token = it re-runs / short-circuits).
+        TOKEN_IS_DEFAULT: ${{ inputs.token == github.token }}
+        # This composite's own action dir (see the commit step's ACTION_PATH note).
+        # The script requires report-comment.js from here.
+        ACTION_PATH: ${{ github.action_path }}
+      with:
+        # DEFAULT token — GITHUB_TOKEN comment edits never fire workflow events.
+        github-token: ${{ github.token }}
+        script: |
+          const { untickApproveBoxes, withStatusBanner, stripApproveCta, applyPartialApproval, hasTickedApproveMarker } =
+            require(`${process.env.ACTION_PATH}/scripts/report-comment.js`);
+          const { owner, repo } = context.repo;
+          const commentId = Number(process.env.COMMENT_ID);
+          const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+          // We only run here after a benign terminal state, so the approval DID
+          // complete (or benignly no-op'd). Mark it reported UP FRONT — even if the
+          // cosmetic banner write below fails — so the always() failure step does
+          // not double-post a "didn't complete" banner over a real success.
+          core.setOutput('reported', 'true');
+
+          try {
+            const current = await github.rest.issues.getComment({ owner, repo, comment_id: commentId });
+            let body = untickApproveBoxes(current.data.body || '');
+            const isPartial = process.env.IS_PARTIAL === 'true';
+
+            // Partial approve: convert the just-approved per-item boxes to
+            // non-interactive "✅ Approved" lines and relabel the still-pending
+            // top-level box (or strip the whole CTA when this partial happened to
+            // cover every remaining item). Runs for BOTH partial terminal states
+            // below (committed and already-up-to-date) — the ticked items were
+            // genuinely approved either way. A full approve strips the entire CTA
+            // instead (below), so this never touches its body. SELECTION is only the
+            // key array (never 'all') when IS_PARTIAL is true.
+            if (isPartial) {
+              body = applyPartialApproval(body, JSON.parse(process.env.SELECTION));
+            }
+            let banner;
+
+            if (process.env.NOTHING_TO_COMMIT === 'true') {
+              // Benign no-op: the approved tree already matched the head branch, so
+              // no new commit was made. On a FULL approve, still strip the whole CTA
+              // — there is nothing left to approve either way, matching the
+              // committed-success full-approve path below. A partial has already had
+              // its approved item boxes relabeled + its CTA handled by
+              // applyPartialApproval above, so nothing more to do to its body here.
+              // Restore a stable, non-progress banner (the boxes stay unticked from
+              // above) rather than leaving "committing…".
+              if (!isPartial) {
+                body = stripApproveCta(body);
+              }
+              banner = [
+                `> ✅ **Already up to date** — the approved baselines already match this branch, so no new commit was needed.`,
+                `>`,
+                `> [View the run →](${runUrl})`,
+              ];
+            } else {
+              const shortSha = process.env.SHORT_SHA;
+              const commitUrl = `${context.serverUrl}/${owner}/${repo}/commit/${process.env.COMMIT_SHA}`;
+              const tokenIsDefault = process.env.TOKEN_IS_DEFAULT === 'true';
+
+              // The retrigger tail. Default token: the check won't re-run on its own
+              // (GITHUB_TOKEN pushes fire no workflow) — mirror the separate success
+              // comment's kick options. Custom token + full approve: the check
+              // re-runs and short-circuits to a fast pass (the main action's
+              // scripts/run-skip.js reads the Tuffgal-Full-Approval trailer this
+              // commit carries). Custom token + partial: it re-runs normally (no
+              // trailer, no short-circuit).
+              const tail = tokenIsDefault
+                ? [
+                    `>`,
+                    `> ⚠️ The visual regression check will not re-run on its own — GitHub does not trigger workflows for commits pushed with \`GITHUB_TOKEN\`. Kick it by closing and reopening this PR, pushing an empty commit, or re-running the visual workflow from the **Actions** tab.`,
+                  ]
+                : isPartial
+                ? [
+                    `>`,
+                    `> The visual regression check re-runs automatically against the new baselines and should pass.`,
+                  ]
+                : [
+                    `>`,
+                    `> The visual regression check re-runs against the new baselines — and since this was a full approval, it short-circuits to a fast pass.`,
+                  ];
+
+              if (isPartial) {
+                banner = [
+                  `> ✅ **Promoted ${process.env.PROMOTED_COUNT} of ${process.env.CANDIDATE_COUNT} candidate baselines** as [\`${shortSha}\`](${commitUrl}).`,
+                  ...tail,
+                ];
+              } else {
+                // Full approve: strip the entire CTA — nothing is left to approve.
+                body = stripApproveCta(body);
+                banner = [
+                  `> ✅ **All baselines approved** and committed as [\`${shortSha}\`](${commitUrl}).`,
+                  ...tail,
+                ];
+              }
+            }
+
+            const newBody = withStatusBanner(body, banner);
+            if (hasTickedApproveMarker(newBody)) {
+              core.warning('Refusing to write final status: outgoing body still carries a ticked approve marker.');
+              return;
+            }
+            await github.rest.issues.updateComment({ owner, repo, comment_id: commentId, body: newBody });
+          } catch (error) {
+            core.warning(`Could not post final status to the sticky comment: ${error.message}`);
+          }
+
+    # ------------------------------------------------------------------ #
+    # 9. Failure sticky-comment status. LAST step, `if: always()`. Fires   #
+    #    only when the gate proceeded, a sticky comment exists, AND the     #
+    #    final step above did NOT report a benign terminal state           #
+    #    (`report_final.outputs.reported != 'true'`) — i.e. the job failed  #
+    #    before/at the commit, or no candidates were found. In a composite  #
+    #    action a step is skipped once an earlier step fails UNLESS it       #
+    #    carries a status function, so `always()` is required to run this    #
+    #    after a hard failure; a skipped final step leaves `reported`        #
+    #    empty, so this fires exactly in the not-yet-reported cases. Never   #
+    #    double-posts over a success (report_final set `reported=true`).     #
+    #                                                                     #
+    #    Step 1b already unticked everything, so the boxes are already      #
+    #    re-tickable; this untick is defense in depth. Same DEFAULT-token   #
+    #    + assert + try/catch discipline.                                   #
+    # ------------------------------------------------------------------ #
+    - name: Report approval failure on the sticky report comment
+      id: report_failure
+      if: always() && steps.gate.outputs.proceed == 'true' && steps.report_status.outputs.comment_id != '' && steps.report_final.outputs.reported != 'true'
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        COMMENT_ID: ${{ steps.report_status.outputs.comment_id }}
+        # This composite's own action dir (see the commit step's ACTION_PATH note).
+        # The script requires report-comment.js from here.
+        ACTION_PATH: ${{ github.action_path }}
+      with:
+        # DEFAULT token — GITHUB_TOKEN comment edits never fire workflow events.
+        github-token: ${{ github.token }}
+        script: |
+          const { untickApproveBoxes, withStatusBanner, hasTickedApproveMarker } =
+            require(`${process.env.ACTION_PATH}/scripts/report-comment.js`);
+          const { owner, repo } = context.repo;
+          const commentId = Number(process.env.COMMENT_ID);
+          const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+          try {
+            const current = await github.rest.issues.getComment({ owner, repo, comment_id: commentId });
+            const banner = [
+              `> ⚠️ **Approval didn't complete** — [check the run](${runUrl}) for details. Re-tick a box or comment \`@tuffgal approve\` to retry.`,
+            ];
+            const newBody = withStatusBanner(untickApproveBoxes(current.data.body || ''), banner);
+            if (hasTickedApproveMarker(newBody)) {
+              core.warning('Refusing to write failure status: outgoing body still carries a ticked approve marker.');
+              return;
+            }
+            await github.rest.issues.updateComment({ owner, repo, comment_id: commentId, body: newBody });
+          } catch (error) {
+            core.warning(`Could not post failure status to the sticky comment: ${error.message}`);
+          }
