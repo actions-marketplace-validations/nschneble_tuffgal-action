@@ -8,6 +8,29 @@ this project uses [Pride Versioning](https://pridever.org) → `PROUD.DEFAULT.SH
 
 _Nothing just yet_
 
+## [v1.7.0] - 2026-08-16
+
+### Added
+
+The sticky PR comment now supports a11y-only changes, e.g. when the baseline
+images are identical but there are structural changes underneath the hood.
+
+### Changed
+
+- Approve checkboxes are locked while an approval runs, so nothing in the
+  sticky PR comment can trigger a second approval
+- A `@tuffgal approve` that lands mid-approval is refused with a note under
+  the status banner, cleared when the running approval finishes
+- The example approve workflow serializes per PR with a `concurrency`
+  group, so copy it to your workflow to keep two approvals off the same
+  branch (the in-comment lock is the user-visible half)
+
+### Fixed
+
+- A story with both new and changed baselines only shows up as new, so the
+  changed candidates cannot be approved from the sticky PR comment
+- The artifact validator reports success for any zip file it cannot read
+
 ## [v1.6.0] - 2026-07-28
 
 ### Added
@@ -226,7 +249,8 @@ Outputs:
 Targets Node 22+
 Compatible with `tuffgal@^0.1.0-alpha.2`
 
-[Unreleased]: https://github.com/nschneble/tuffgal-action/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/nschneble/tuffgal-action/compare/v1.7.0...HEAD
+[v1.7.0]: https://github.com/nschneble/tuffgal-action/releases/tag/v1.7.0
 [v1.6.0]: https://github.com/nschneble/tuffgal-action/releases/tag/v1.6.0
 [v1.5.0]: https://github.com/nschneble/tuffgal-action/releases/tag/v1.5.0
 [v1.4.1]: https://github.com/nschneble/tuffgal-action/releases/tag/v1.4.1

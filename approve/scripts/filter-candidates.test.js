@@ -1,16 +1,9 @@
 'use strict';
 //
-// Unit tests for the pure candidate-selection filter. No deps beyond Node's
-// built-in `node:test` + `node:assert` — run with
-// `node --test approve/scripts/*.test.js`.
-//
-// This is a security-load-bearing filter: it turns an UNTRUSTED per-item approve
-// selection (parsed from a PR comment a write actor can edit) into the set of
-// candidate action-dirs the CLI is allowed to promote. The malformed-key and the
-// 'all' no-op arms are the load-bearing cases — the first MUST drop spoofed keys
-// fail-closed (never keep, never remove, never throw), the second MUST leave the
-// tree untouched so every existing full-approve consumer is byte-for-byte
-// unchanged. Both MUST fail if the corresponding guard is reverted.
+// Tests for the candidate-selection filter, which turns an UNTRUSTED per-item
+// selection into the dirs the CLI may promote. Load-bearing arms: a spoofed key is
+// dropped fail-closed (never kept, never removed, never thrown), and 'all' leaves
+// the tree untouched.
 //
 const { test } = require('node:test');
 const assert = require('node:assert');
@@ -203,4 +196,30 @@ test('ACTION_NAME_PATTERN accepts real action keys and rejects the spoof shapes'
   assert.ok(!ACTION_NAME_PATTERN.test('key/with/slash'));
   assert.ok(!ACTION_NAME_PATTERN.test('results.json'));
   assert.ok(!ACTION_NAME_PATTERN.test(''));
+});
+
+// --- cross-package pin: the action-key allowlist ---------------------------- //
+
+// ACTION_NAME_PATTERN is HAND-DUPLICATED between this module (the delete side)
+// and scripts/build-comment.js (the render side, which scripts/build-stories.js
+// filters with). The two packages cannot cross-require at runtime, but a test
+// runs against the whole checkout — so the copies are pinned to each other here,
+// the same way report-comment.test.js pins REPORT_MARKER to build-comment.js's
+// MARKER. Without this, one side could widen and the other stay narrow.
+const { ACTION_NAME_PATTERN: RENDER_SIDE_PATTERN } = require('../../scripts/build-comment.js');
+
+test('ACTION_NAME_PATTERN is byte-identical to build-comment.js\'s copy', () => {
+  assert.strictEqual(String(ACTION_NAME_PATTERN), String(RENDER_SIDE_PATTERN));
+  assert.strictEqual(String(ACTION_NAME_PATTERN), '/^[a-z0-9-]+$/');
+});
+
+test('both copies agree on the same keys, valid and malformed', () => {
+  for (const key of ['visit-home', 'a', 'x-1']) {
+    assert.strictEqual(ACTION_NAME_PATTERN.test(key), true);
+    assert.strictEqual(RENDER_SIDE_PATTERN.test(key), true);
+  }
+  for (const key of ['Visit-Home', '../escape', 'a_b', '', 'a b', 'a/b']) {
+    assert.strictEqual(ACTION_NAME_PATTERN.test(key), false, `${key} must be refused`);
+    assert.strictEqual(RENDER_SIDE_PATTERN.test(key), false, `${key} must be refused`);
+  }
 });

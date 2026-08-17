@@ -1,7 +1,6 @@
 "use strict";
 //
-// Unit tests for the pure sticky-comment body builder. No deps beyond Node's
-// built-in `node:test` + `node:assert` — run with `node --test scripts/*.test.js`.
+// Tests for the sticky-comment body builder.
 //
 const { test } = require("node:test");
 const assert = require("node:assert");
@@ -1071,4 +1070,278 @@ test("the multi-breakpoint checkbox suffix stays invisible to resolve-approver's
   assert.strictEqual(verdict.via, "checkbox");
   // The suffix did not perturb key extraction: exactly the two embedded keys.
   assert.deepStrictEqual(verdict.selection.sort(), ["hover-cta", "visit-home"]);
+});
+
+// An a11y-only changed shot: pixels matched, the accessibility tree drifted, so
+// the shot carries results.json's a11yDiff payload instead of a real image pair.
+const a11yShot = (overrides = {}) => [
+  {
+    breakpoint: undefined,
+    baseline: null,
+    actual: null,
+    a11yOnly: true,
+    a11yDiff: {
+      lines: [' - navigation:', '-  - link "Home"', '+  - link "Home page"'],
+      added: 1,
+      removed: 1,
+      truncated: false,
+    },
+    ...overrides,
+  },
+];
+
+const a11yEntry = (shots) => ({
+  index: 0,
+  name: "Home hero",
+  shots,
+  actionKeys: ["visit-home"],
+});
+
+test("an a11y-only changed story renders its diff instead of thumbnails, preview or not", () => {
+  for (const previewUrl of ["", "https://pages.example/pr-1"]) {
+    const body = buildCommentBody({
+      ...base(),
+      outcome: "changed",
+      counts: { ...base().counts, changed: "1", total: "4" },
+      previewUrl,
+      changed: [a11yEntry(a11yShot())],
+    });
+    assert.match(body, /Pixels unchanged\. The accessibility snapshot drifted\./);
+    assert.match(body, /```diff\n - navigation:\n-  - link "Home"\n\+  - link "Home page"\n```/);
+    assert.ok(!body.includes("<img"), "no thumbnails for two identical PNGs");
+    assert.ok(!body.includes("| Baseline | Actual |"), "no screenshot table");
+  }
+});
+
+test("an a11y-only checkbox names why the entry has no visible change", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "changed",
+    counts: { ...base().counts, changed: "1", total: "4" },
+    changed: [a11yEntry(a11yShot())],
+  });
+  const checkboxLine = body
+    .split("\n")
+    .find((l) => l.includes("tuffgal-approve-item:visit-home"));
+  assert.match(checkboxLine, /Approve \*\*Home hero\*\* — a11y only$/);
+});
+
+test("the a11y-only suffix stays invisible to resolve-approver's marker regex", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "changed",
+    counts: { ...base().counts, changed: "1", total: "4" },
+    changed: [a11yEntry(a11yShot())],
+  });
+  const tickedBody = body.replace(
+    "- [ ] <!-- tuffgal-approve-item:visit-home -->",
+    "- [x] <!-- tuffgal-approve-item:visit-home -->"
+  );
+  const verdict = resolveApprover({
+    eventName: "issue_comment",
+    action: "edited",
+    comment: { body: tickedBody, user: { login: "maintainer" } },
+    issue: { pull_request: {} },
+    contextActor: "maintainer",
+  });
+  assert.strictEqual(verdict.proceed, true);
+  assert.deepStrictEqual(verdict.selection, ["visit-home"]);
+});
+
+test("an a11y-only story links the report when a preview is present", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "changed",
+    counts: { ...base().counts, changed: "1", total: "4" },
+    previewUrl: "https://pages.example/pr-1",
+    changed: [a11yEntry(a11yShot())],
+  });
+  assert.match(
+    body,
+    /\[Open Home hero in report →\]\(https:\/\/pages\.example\/pr-1\/report\/index\.html#story-0\)/
+  );
+});
+
+test("an a11y-only story with no recorded diff degrades to prose with its counts", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "changed",
+    counts: { ...base().counts, changed: "1", total: "4" },
+    changed: [
+      a11yEntry(
+        a11yShot({ a11yDiff: { lines: [], added: 2100, removed: 2100, truncated: true } })
+      ),
+    ],
+  });
+  assert.match(body, /_No line diff available \(2100 added, 2100 removed\) — open the report/);
+  assert.ok(!body.includes("```diff"), "no empty diff block");
+});
+
+test("an a11y-only story from a tuffgal with no a11yDiff field still explains itself", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "changed",
+    counts: { ...base().counts, changed: "1", total: "4" },
+    changed: [a11yEntry(a11yShot({ a11yDiff: null }))],
+  });
+  assert.match(body, /Pixels unchanged\. The accessibility snapshot drifted\./);
+  assert.match(body, /_No line diff available — open the report/);
+});
+
+test("a long a11y diff is clipped in the comment and says so with the full counts", () => {
+  const lines = Array.from({ length: 30 }, (_, i) => `+  - link "${i}"`);
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "changed",
+    counts: { ...base().counts, changed: "1", total: "4" },
+    changed: [
+      a11yEntry(
+        a11yShot({ a11yDiff: { lines, added: 30, removed: 0, truncated: false } })
+      ),
+    ],
+  });
+  assert.ok(body.includes('+  - link "19"'), "keeps the first 20 lines");
+  assert.ok(!body.includes('+  - link "20"'), "drops the rest");
+  assert.match(body, /_Diff clipped — 30 added, 0 removed in full\._/);
+});
+
+test("the diff fence grows past a backtick run inside a snapshot line", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "changed",
+    counts: { ...base().counts, changed: "1", total: "4" },
+    changed: [
+      a11yEntry(
+        a11yShot({
+          a11yDiff: {
+            lines: ['+  - code "```"'],
+            added: 1,
+            removed: 0,
+            truncated: false,
+          },
+        })
+      ),
+    ],
+  });
+  assert.match(body, /````diff\n\+  - code "```"\n````/);
+});
+
+test("a multi-breakpoint story mixes a thumbnail row with an a11y diff section", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "changed",
+    counts: { ...base().counts, changed: "1", total: "4" },
+    previewUrl: "https://pages.example/pr-1",
+    multiBreakpoint: true,
+    changed: [
+      {
+        index: 0,
+        name: "Home hero",
+        actionKeys: ["visit-home"],
+        shots: [
+          {
+            breakpoint: "mobile",
+            baseline: "https://pages.example/pr-1/baselines/visit-home/mobile.png",
+            actual: "https://pages.example/pr-1/report/actual/visit-home/mobile.png",
+            a11yOnly: false,
+            a11yDiff: null,
+          },
+          {
+            breakpoint: "desktop",
+            baseline: null,
+            actual: null,
+            a11yOnly: true,
+            a11yDiff: {
+              lines: ['-  - link "Home"', '+  - link "Home page"'],
+              added: 1,
+              removed: 1,
+              truncated: false,
+            },
+          },
+        ],
+      },
+    ],
+  });
+  assert.match(body, /\| mobile \| <img src="https:\/\/pages\.example\/pr-1\/baselines/);
+  assert.ok(
+    !/\| desktop \|/.test(body),
+    "the a11y-only breakpoint gets no thumbnail row"
+  );
+  assert.match(
+    body,
+    /\*\*desktop\*\* — pixels unchanged, accessibility snapshot drifted\./
+  );
+  assert.match(body, /```diff\n-  - link "Home"\n\+  - link "Home page"\n```/);
+  // The entry still drifted in pixels somewhere, so it is not labelled a11y-only.
+  const checkboxLine = body
+    .split("\n")
+    .find((l) => l.includes("tuffgal-approve-item:visit-home"));
+  assert.ok(!checkboxLine.includes("a11y only"));
+});
+
+test("a pixel-drifted changed story is unaffected by the a11y-only branch", () => {
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "changed",
+    counts: { ...base().counts, changed: "1", total: "4" },
+    previewUrl: "https://pages.example/pr-1",
+    changed: [
+      {
+        index: 0,
+        name: "Home hero",
+        actionKeys: ["visit-home"],
+        shots: [
+          {
+            breakpoint: undefined,
+            baseline: "https://pages.example/pr-1/baselines/visit-home/0.png",
+            actual: "https://pages.example/pr-1/report/actual/visit-home/0.png",
+            a11yOnly: false,
+            a11yDiff: null,
+          },
+        ],
+      },
+    ],
+  });
+  assert.match(body, /\| Baseline \| Actual \|/);
+  assert.ok(!body.includes("```diff"));
+  assert.ok(!body.includes("a11y only"));
+});
+
+test("a diff line carrying a newline cannot break out of its fenced block", () => {
+  // tuffgal's payload is one entry per line, but the comment is markdown: a line
+  // smuggling its own newline plus a fence would otherwise close the block early
+  // and let raw HTML through. The fence grows past the longest backtick RUN,
+  // which is measured across the whole entry, newline included.
+  const body = buildCommentBody({
+    ...base(),
+    outcome: "changed",
+    counts: { ...base().counts, changed: "1", total: "4" },
+    changed: [
+      a11yEntry(
+        a11yShot({
+          a11yDiff: {
+            lines: ['+  - text "a\n```\n<img src=x onerror=alert(1)>"'],
+            added: 1,
+            removed: 0,
+            truncated: false,
+          },
+        })
+      ),
+    ],
+  });
+  const fence = "`".repeat(4);
+  assert.ok(body.includes(`${fence}diff`), "the fence grew past the embedded run");
+  // Everything between the opening and closing fence is inert; nothing after the
+  // embedded newline escapes into the surrounding markdown.
+  const opened = body.split(`${fence}diff\n`)[1];
+  const inside = opened.split(`\n${fence}`)[0];
+  assert.ok(inside.includes("<img src=x onerror=alert(1)>"), "payload stays inside the fence");
+  // The embedded 3-backtick run sits INSIDE the block: the block's own closing
+  // fence is the 4-backtick one after the payload, not the smuggled one.
+  assert.ok(inside.includes("```"), "the smuggled fence is inert content");
+  assert.strictEqual(
+    body.indexOf(`\n${fence}\n`) > body.indexOf("<img src=x"),
+    true,
+    "the block closes after the payload, not before it"
+  );
 });
